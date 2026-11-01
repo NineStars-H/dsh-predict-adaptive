@@ -2,7 +2,15 @@
 
 Codex 风格的输入框预测：每轮对话结束后，由**当前会话所选模型**起草你的下一句话，以灰色幽灵文本显示在输入框上方，按 **Tab** 填入。
 
-DeepSeek Harness 插件。装上即用，官方插件页可开关，卸载不留残余。
+DeepSeek Harness 插件。装上即用，官方插件页可开关。
+
+### v1.0.1 稳定性更新
+
+- 停用和重载时保留设置及学习记录，并修复已保存设置被默认值覆盖的问题。
+- 桥接复用 DSH 会话认证；过期预测的失败结果不会覆盖当前状态。
+- 避免快速预测被延迟轮询清除，以及同一轮由事件和轮询重复触发预测。
+
+已使用 DSH 桌面版内置的 `0.2.1-rc.5` Web 宿主验证。宿主插件接口仍可能变化；缺少所需认证接口的版本会拒绝桥接请求。
 
 > ## ⚠️ 先读这一段：每一轮都会多一次模型调用
 >
@@ -100,7 +108,7 @@ cmd /c rmdir "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-prompt-pre
 | 继承会话权限 | 开 | 告知预测当前沙箱与审批状态，避免建议无权执行的动作 |
 | 预测上下文 | 完整 | `完整上下文` 重放整段对话；`最近轮次` 只保留末尾几轮 |
 | 保留轮数 | 6 | `最近轮次` 模式下保留几轮 |
-| 诊断端点 | 关 | 开发用。开启后 `/diagnose` 可手动触发一次预测（会消耗一次模型调用并转发转录） |
+| 诊断端点 | 关 | 开发用。开启后用 POST 请求 `/diagnose?sessionId=...` 可手动触发一次预测（会消耗一次模型调用并转发转录） |
 
 改动后点**保存**，会显示「已保存设置」。
 
@@ -143,12 +151,12 @@ prediction skipped: the provider is rate limited or out of quota
 ## 隐私与安全
 
 - 预测内容**不写入**会话日志，不参与回放
-- HTTP 桥接有同源校验：只接受来自页面自身 origin 的请求，伪造 `Origin` 一律 403
+- HTTP 桥接复用 DSH `connection` 的请求认证和 Host/Origin 校验；修改请求还要求 `Origin`。它依赖宿主提供 `connection.requestRejection`；缺失或检查出错时桥接返回 503，不降级为仅检查请求头。
 - 诊断端点默认关闭；关闭时返回 403
-- 唯一的持久化数据是 `$DSH_PROFILE_DIR/prompt-predict-adaptive/` 下的两个 JSON：
+- 持久化数据位于 `DSH_PROFILE_DIR`（未设置时回退到 `DSH_HOME`）下 `prompt-predict-adaptive/` 目录中的两个 JSON：
   - `config.json`：你的设置
   - `feedback.json`：学习到的措辞示例（最多 20 个会话 × 8 条）
-- 卸载时这两个文件连同目录一起删除
+- 停用、重载和卸载均保留这两个文件；如需删除，卸载后按下方说明手动清理。
 
 学习数据**可以直接删**，删掉只丢失措辞偏好，不影响任何功能。
 
@@ -167,7 +175,14 @@ prediction skipped: the provider is rate limited or out of quota
 - `package.json` 中的依赖
 - profile 的 bundle 选择项
 - `node_modules` 链接
-- 插件自己的状态目录
+
+宿主的普通清理回调无法可靠区分停用、重载与卸载，因此插件不会自动删除持久数据。确认不再需要设置和学习记录后，可删除实际 profile 下的 `prompt-predict-adaptive` 目录；例如使用默认桌面 profile 时：
+
+```powershell
+Remove-Item -LiteralPath "$env:USERPROFILE\.dsh\profiles\desktop\prompt-predict-adaptive" -Recurse -Force
+```
+
+如果使用自定义 `DSH_PROFILE_DIR` 或 `DSH_HOME`，请先确认实际目录，再删除其中的 `prompt-predict-adaptive`。
 
 pnpm 的 `link:` 安装偶尔会在 `node_modules` 留下一个悬空软链接，可手动清理：
 
