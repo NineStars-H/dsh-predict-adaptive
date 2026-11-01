@@ -19,13 +19,12 @@
  *    to `ctx.llm.stream()`; it is not an agent step, appends no session event,
  *    and cannot appear in the surface, the transcript, or a later replay.
  *
- * 3. **Uninstalling leaves nothing behind.** The only durable artifact is one
- *    JSON file under the plugin's own state directory, and its disposer removes
- *    it. Nothing is written into the profile, the session log, or settings.
+ * 3. **Durable settings survive plugin deactivation.** State is kept under the
+ *    profile until the user explicitly removes it after uninstalling.
  *
  * @module dsh-prompt-predict-adaptive
  */
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 /** Route prefix owned by this plugin; the Client half posts here. */
@@ -499,7 +498,7 @@ export function apply(ctx, rawConfig) {
   } catch {
     /* first run, or the file was removed with a previous uninstall */
   }
-  const live = resolveConfig({ ...persisted, ...config });
+  const live = resolveConfig({ ...config, ...persisted });
 
   let persistedFeedback = {};
   try {
@@ -637,6 +636,22 @@ export function apply(ctx, rawConfig) {
    * result if the epoch moved on.
    */
   const dropEpoch = new Map();
+  // The polling fallback can observe a submission after a fast prediction for
+  // that same completed turn has already started or finished.
+  const predictionUserCount = new Map();
+  const predictionTurnKey = new Map();
+
+  function predictionBoundary(session) {
+    let count = 0;
+    let lastUser = -1;
+    let lastTurn = -1;
+    for (let seq = Math.max(0, session.seq - 400); seq < session.seq; seq += 1) {
+      const type = session.eventAt(seq)?.type;
+      if (type === "user/message") { count += 1; lastUser = seq; }
+      if (type === "turn/end") lastTurn = seq;
+    }
+    return { count, key: lastUser < 0 && lastTurn < 0 ? undefined : `${lastUser}:${lastTurn}` };
+  }
 
   /** Invalidate in-flight predictions and forget anything pending for a session. */
   function consumePending(sessionId) {
@@ -657,6 +672,15 @@ export function apply(ctx, rawConfig) {
   /** Ask for a prediction for one agent, superseding any in-flight one. */
   function runPrediction(agent, sessionId) {
     if (!live.enabled) return;
+    try {
+      const boundary = predictionBoundary(agent.session);
+      if (boundary.key !== undefined && predictionTurnKey.get(sessionId) === boundary.key) return;
+      if (boundary.key !== undefined) predictionTurnKey.set(sessionId, boundary.key);
+      predictionUserCount.set(sessionId, boundary.count);
+    } catch {
+      predictionUserCount.delete(sessionId);
+      predictionTurnKey.delete(sessionId);
+    }
     // A new turn begins here, so whatever was recallable belongs to the previous
     // exchange. Keeping it would let the accepted-then-sent line resurface as the
     // auto-restore fallback in the newly emptied composer.
@@ -676,8 +700,8 @@ export function apply(ctx, rawConfig) {
     inflight.set(sessionId, controller);
     predict(ctx, agent, live, feedbackFor(sessionId), controller.signal).then(
       (result) => {
-        if (inflight.get(sessionId) === controller) inflight.delete(sessionId);
-        if (controller.signal.aborted) return;
+        if (inflight.get(sessionId) !== controller || controller.signal.aborted) return;
+        inflight.delete(sessionId);
         // The composer was submitted while this was in flight: the answer is
         // about a conversation the user already moved past.
         if ((dropEpoch.get(sessionId) ?? 0) !== epoch) return;
@@ -697,7 +721,8 @@ export function apply(ctx, rawConfig) {
         }
       },
       (error) => {
-        if (inflight.get(sessionId) === controller) inflight.delete(sessionId);
+        if (inflight.get(sessionId) !== controller || controller.signal.aborted || (dropEpoch.get(sessionId) ?? 0) !== epoch) return;
+        inflight.delete(sessionId);
         const message = String(error && error.message ? error.message : error);
         diagnostics.lastError = message;
         lastError.set(sessionId, message);
@@ -804,7 +829,9 @@ export function apply(ctx, rawConfig) {
       const previousUsers = lastUserCount.get(sessionId);
       lastUserCount.set(sessionId, userMessages);
       if (previousUsers !== undefined && userMessages > previousUsers) {
-        consumePending(sessionId);
+        // A prediction already based on this submission is fresh. Only cancel
+        // work that started before the newly observed user message.
+        if ((predictionUserCount.get(sessionId) ?? -1) < userMessages) consumePending(sessionId);
         // Advance the baseline so the turn that ended alongside this submission
         // does not immediately produce a suggestion for a conversation the user
         // has already moved past.
@@ -835,43 +862,8 @@ export function apply(ctx, rawConfig) {
   // Remote namespace, so it talks to this route over the same origin it was
   // served from.
   //
-  // `webServer.register` sits BEFORE the host's own auth middleware (observed:
-  // every DSH route answers 401 without a session, this one answered 200), so
-  // the handler must establish its own trust boundary. Two checks do that:
-  //
-  //   * the request must come from the page's own origin, and
-  //   * mutating verbs must carry the same origin in `Origin`, which a foreign
-  //     page cannot forge for a cross-site request.
-  //
-  // Anything else is refused before the body is read.
-  const allowedHosts = new Set();
-  try {
-    const origin = ctx.get("webServer")?.getOrigin?.();
-    if (typeof origin === "string" && origin.length > 0) {
-      allowedHosts.add(new URL(origin).host);
-    }
-  } catch {
-    /* before listen binds, the origin is unavailable; the Host header check
-       then simply falls back to loopback names below */
-  }
-  for (const name of ["127.0.0.1", "localhost", "[::1]"]) allowedHosts.add(name);
-
-  /** Decide whether a request may reach this bridge at all. */
-  function trusted(req) {
-    const host = typeof req.headers.host === "string" ? req.headers.host : "";
-    // Strip the port: any port on a loopback name is the same machine.
-    const bare = host.replace(/:\d+$/, "").toLowerCase();
-    if (!allowedHosts.has(host) && !allowedHosts.has(bare)) return false;
-    const origin = req.headers.origin;
-    if (typeof origin === "string" && origin.length > 0) {
-      try {
-        if (!allowedHosts.has(new URL(origin).host)) return false;
-      } catch {
-        return false;
-      }
-    }
-    return true;
-  }
+  // Registered routes bypass the host's /api adapter. Reuse its admission
+  // decision, including signed session verification and Host/Origin checks.
 
   const offRoute = ctx.webServer.register({
     kind: "prefix",
@@ -889,7 +881,18 @@ export function apply(ctx, rawConfig) {
         res.end(payload);
       };
 
-      if (!trusted(req)) return send(403, { ok: false, error: "forbidden" });
+      const connection = ctx.get("connection");
+      if (typeof connection?.requestRejection !== "function") {
+        return send(503, { ok: false, error: "DSH connection authentication unavailable" });
+      }
+      let rejection;
+      try {
+        rejection = connection.requestRejection(req);
+      } catch {
+        return send(503, { ok: false, error: "DSH connection authentication unavailable" });
+      }
+      if (rejection !== undefined) return send(rejection === 403 ? 403 : 401, { ok: false, error: "unauthorized" });
+      if (req.method !== "GET" && !req.headers.origin) return send(403, { ok: false, error: "origin required" });
 
       try {
         if (action === "get") {
@@ -918,6 +921,7 @@ export function apply(ctx, rawConfig) {
           });
         }
         if (action === "diagnose") {
+          if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
           // Runs one prediction immediately against a live agent, bypassing the
           // turn boundary, so a broken path is visible without waiting.
           //
@@ -1073,6 +1077,8 @@ export function apply(ctx, rawConfig) {
     lastSeen.clear();
     lastUserCount.clear();
     dropEpoch.clear();
+    predictionUserCount.clear();
+    predictionTurnKey.clear();
     offCreated();
     offDisposed();
     for (const dispose of agentDisposers.values()) {
@@ -1097,12 +1103,7 @@ export function apply(ctx, rawConfig) {
     history.clear();
     lastError.clear();
     lastGlobalError = null;
-    // Uninstall leaves no residue: the state directory is ours alone.
-    try {
-      rmSync(stateDir, { recursive: true, force: true });
-    } catch {
-      /* nothing to remove */
-    }
+    // A disposer also runs on disable/reload; durable state must survive it.
   });
 }
 

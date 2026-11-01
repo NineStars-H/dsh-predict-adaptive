@@ -1,0 +1,144 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { Readable } from 'node:stream';
+import { apply } from '../index.js';
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events } = {}) {
+  const listeners = new Map();
+  let route, dispose;
+  const agent = {
+    session: { id: 's1', get seq() { return events?.length ?? 1; }, surface: { nodes: [0] }, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), eventAt: (seq) => events?.[seq] ?? {}, deriveEventMessage: () => ({ role: 'user', content: 'hello' }) },
+    ctx: { on: (name, fn) => { listeners.set(name, fn); return () => listeners.delete(name); } },
+  };
+  const connection = auth && { requestRejection: auth };
+  const ctx = {
+    get: (key) => key === 'connection' ? connection : undefined,
+    llm: { stream: stream ?? (async function* () { yield { type: 'text-delta', text: 'Continue testing' }; }) },
+    agents: { list: () => [agent], get: () => agent },
+    on: () => () => {},
+    webServer: { register: (r) => { route = r.handler; return () => {}; } },
+    effect: (fn) => { dispose = fn(); },
+  };
+  let poll;
+  const originalInterval = globalThis.setInterval;
+  if (events) globalThis.setInterval = (callback) => { poll = callback; return { unref() {} }; };
+  try { apply(ctx, { enabled: true, mode: 'full', recentTurns: 6 }); }
+  finally { globalThis.setInterval = originalInterval; }
+  return {
+    dispose: () => dispose(),
+    trigger: () => listeners.get('agent/status')({ status: 'idle' }),
+    poll: () => poll(),
+    async request(path, { method = 'GET', cookie = 'valid', origin = 'http://localhost', body } = {}) {
+      const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
+      Object.assign(req, { url: `/prompt-predict-adaptive/${path}`, method, headers: { host: 'localhost', cookie, ...(origin === null ? {} : { origin }) } });
+      let status, output;
+      const res = { writeHead: (s) => { status = s; }, end: (s) => { output = JSON.parse(s); } };
+      await route(req, res);
+      return { status, body: output };
+    },
+  };
+}
+
+test('authentication is required and unavailable authentication fails closed', async () => {
+  const h = harness({ auth: (req) => req.headers.origin === 'http://evil' ? 403 : req.headers.cookie === 'valid' ? undefined : 401 });
+  try {
+    assert.equal((await h.request('get', { cookie: '' })).status, 401);
+    for (const action of ['config', 'accepted', 'dismiss', 'drop', 'reset', 'diagnose']) {
+      assert.equal((await h.request(action, { method: 'POST', cookie: '', body: {} })).status, 401);
+    }
+    assert.equal((await h.request('get', { origin: 'http://evil' })).status, 403);
+    assert.equal((await h.request('config', { method: 'POST', origin: null, body: {} })).status, 403);
+    assert.equal((await h.request('get')).status, 200);
+    assert.equal((await h.request('diagnose')).status, 405);
+  } finally { h.dispose(); }
+  const unavailable = harness({ auth: null });
+  try { assert.equal((await unavailable.request('get')).status, 503); } finally { unavailable.dispose(); }
+  const throws = harness({ auth: () => { throw Error('unavailable'); } });
+  try { assert.equal((await throws.request('get')).status, 503); } finally { throws.dispose(); }
+});
+
+test('polling does not discard a prediction already based on the newly completed turn', async () => {
+  const events = [{ type: 'user/message' }, { type: 'turn/end', data: { turn: 1 } }];
+  const h = harness({ events });
+  try {
+    h.poll();
+    events.push({ type: 'user/message' }, { type: 'turn/end', data: { turn: 2 } });
+    h.trigger(); await delay(450);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
+    h.poll();
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
+    events.push({ type: 'user/message' });
+    h.poll();
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion, null);
+  } finally { h.dispose(); }
+});
+
+test('an event and a later polling observation of the same turn make only one prediction', async () => {
+  const events = [{ type: 'user/message' }, { type: 'turn/end', data: { turn: 1 } }];
+  let calls = 0;
+  const h = harness({ events, stream: async function* () { calls++; yield { type: 'text-delta', text: 'Test suggestion' }; } });
+  try {
+    h.poll();
+    events.push({ type: 'user/message' });
+    h.poll();
+    events.push({ type: 'turn/end', data: { turn: 2 } });
+    h.trigger(); await delay(450);
+    h.poll(); await delay(10);
+    assert.equal(calls, 1);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Test suggestion');
+  } finally { h.dispose(); }
+});
+
+test('settings and learned feedback survive disposal and reload', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-predict-test-'));
+  const previous = process.env.DSH_PROFILE_DIR;
+  process.env.DSH_PROFILE_DIR = dir;
+  let h;
+  try {
+    h = harness();
+    assert.equal((await h.request('config', { method: 'POST', body: { mode: 'recent', recentTurns: 3 } })).status, 200);
+    h.trigger(); await delay(450);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
+    await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });
+    const config = readFileSync(join(dir, 'prompt-predict-adaptive', 'config.json'), 'utf8');
+    const feedback = readFileSync(join(dir, 'prompt-predict-adaptive', 'feedback.json'), 'utf8');
+    h.dispose(); h = null;
+    assert.equal(readFileSync(join(dir, 'prompt-predict-adaptive', 'config.json'), 'utf8'), config);
+    assert.equal(readFileSync(join(dir, 'prompt-predict-adaptive', 'feedback.json'), 'utf8'), feedback);
+    h = harness();
+    const result = (await h.request('get?sessionId=s1')).body;
+    assert.equal(result.config.mode, 'recent'); assert.equal(result.config.recentTurns, 3);
+    assert.equal(result.learned.accepted, 1);
+  } finally {
+    h?.dispose();
+    if (previous === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('superseded or dropped prediction failures cannot replace current state', async () => {
+  const pending = [];
+  const h = harness({ stream: () => (async function* () { const value = await new Promise((resolve, reject) => pending.push({ resolve, reject })); yield { type: 'text-delta', text: value }; })() });
+  try {
+    h.trigger(); await delay(450);
+    h.trigger(); await delay(450);
+    assert.equal(pending.length, 2);
+    pending[1].resolve('New suggestion'); await delay(10);
+    pending[0].reject(Error('old failure')); await delay(10);
+    let state = (await h.request('get?sessionId=s1')).body;
+    assert.equal(state.suggestion.text, 'New suggestion'); assert.equal(state.error, null);
+    h.trigger(); await delay(450);
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    pending[2].reject(Error('dropped failure')); await delay(10);
+    state = (await h.request('get?sessionId=s1')).body;
+    assert.equal(state.suggestion, null); assert.equal(state.error, null);
+    h.trigger(); await delay(450);
+    pending[3].reject(Error('current failure')); await delay(10);
+    assert.equal((await h.request('get?sessionId=s1')).body.error, 'current failure');
+  } finally { h.dispose(); }
+});
