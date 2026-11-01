@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Composer Predictions (Adaptive)",
+    "description": "After each turn, the session's own model drafts your next message as ghost text above the composer. Press Tab to fill it in. This build also learns from the drafts you accept or dismiss."
+  }
+}

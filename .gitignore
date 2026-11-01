@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build and pack output
+*.tgz
+dist/
+build/
+
+# Editor and OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local runtime state (never committed)
+prompt-predict-adaptive/
+*.local.json
+*.log

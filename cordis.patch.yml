@@ -1,0 +1,7 @@
+- insert:
+    - id: prompt-predict-adaptive
+      name: 'dsh-prompt-predict-adaptive'
+      config:
+        enabled: true
+        mode: full
+        recentTurns: 6
