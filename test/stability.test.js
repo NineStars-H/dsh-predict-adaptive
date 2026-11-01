@@ -32,6 +32,7 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
   return {
     dispose: () => dispose(),
     trigger: () => listeners.get('agent/status')({ status: 'idle' }),
+    stopping: (turn) => listeners.get('agent/turn-stopping')({ turn }),
     poll: () => poll(),
     async request(path, { method = 'GET', cookie = 'valid', origin = 'http://localhost', body } = {}) {
       const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -126,6 +127,47 @@ test('idle before turn/end and polling afterwards do not generate twice', async 
     h.trigger(); await delay(450);
     events.push({ type: 'turn/end', data: { turn: 2 } });
     h.poll(); await delay(10);
+    assert.equal(calls, 1);
+  } finally { h.dispose(); }
+});
+
+test('a long turn bills once even after its user message leaves the scan window', async () => {
+  // A tool-heavy turn appends enough events that the `user/message` that opened
+  // it is no longer inside the 400-event tail the boundary scan reads. The turn
+  // number must still identify the turn, so the stopping trigger and the poll
+  // that follows agree instead of charging twice.
+  const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'user/message' }, { type: 'turn/end', data: { turn: 1 } }];
+  let calls = 0;
+  const h = harness({ events, stream: async function* () { calls++; yield { type: 'text-delta', text: 'Long turn draft' }; } });
+  try {
+    h.poll(); await delay(10);
+    // The turn being measured: submission, then hundreds of tool events.
+    events.push({ type: 'turn/start', data: { turn: 2 } }, { type: 'user/message' });
+    for (let i = 0; i < 120; i += 1) {
+      events.push({ type: 'step/start' }, { type: 'assistant/message' }, { type: 'tool/call' }, { type: 'tool/result' }, { type: 'step/end' });
+    }
+    h.stopping(2); await delay(450);
+    assert.equal(calls, 1, 'the stopping trigger predicts once');
+    events.push({ type: 'turn/end', data: { turn: 2 } });
+    h.poll(); await delay(20);
+    assert.equal(calls, 1, 'the poll does not bill the same turn again');
+  } finally { h.dispose(); }
+});
+
+test('a turn with no user message in the window still bills once', async () => {
+  // Continuation turns can close without a fresh `user/message` nearby. A
+  // sequence-numbered boundary changed when `turn/end` was appended and billed
+  // such a turn twice; the turn number does not move.
+  const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'turn/end', data: { turn: 1 } }];
+  let calls = 0;
+  const h = harness({ events, stream: async function* () { calls++; yield { type: 'text-delta', text: 'Continuation draft' }; } });
+  try {
+    h.poll(); await delay(10);
+    events.push({ type: 'turn/start', data: { turn: 2 } });
+    h.stopping(2); await delay(450);
+    assert.equal(calls, 1);
+    events.push({ type: 'turn/end', data: { turn: 2 } });
+    h.poll(); await delay(20);
     assert.equal(calls, 1);
   } finally { h.dispose(); }
 });

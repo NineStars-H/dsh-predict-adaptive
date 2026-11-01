@@ -580,15 +580,22 @@ export function apply(ctx, rawConfig) {
   function bindAgent(agent) {
     const sessionId = agent.session.id;
     let pending = null;
+    /** Highest turn number seen in the current trigger burst. */
+    let scheduledTurn = 0;
 
     /** Collapse bursts from several triggers into one prediction per turn. */
-    function schedule(reason) {
+    function schedule(reason, turn) {
       if (pending !== null) clearTimeout(pending);
+      // Keep the highest turn seen in the burst. `agent/status` carries no turn
+      // number, so it must not erase one a sibling trigger already supplied.
+      if (Number.isInteger(turn)) scheduledTurn = Math.max(scheduledTurn, turn);
       pending = setTimeout(() => {
         pending = null;
+        const settled = scheduledTurn;
+        scheduledTurn = 0;
         diagnostics.stopping += 1;
         diagnostics.lastAt = Date.now();
-        runPrediction(agent, sessionId);
+        runPrediction(agent, sessionId, settled);
       }, 400);
       if (reason === "turn-end") diagnostics.turnEnd += 1;
     }
@@ -601,7 +608,7 @@ export function apply(ctx, rawConfig) {
       // Only a settled turn is worth predicting against; a forked or
       // interrupted turn leaves the conversation mid-thought.
       if (reason?.kind === "forked" || reason?.kind === "aborted" || reason?.kind === "interrupted") return;
-      schedule("turn-end");
+      schedule("turn-end", event.data?.turn);
     });
 
     // 2) Agent went idle: covers paths that end without a normal turn close.
@@ -611,9 +618,10 @@ export function apply(ctx, rawConfig) {
       schedule("idle");
     });
 
-    // 3) The loop's own stopping boundary.
-    const disposeStopping = agent.ctx.on("agent/turn-stopping", () => {
-      schedule("stopping");
+    // 3) The loop's own stopping boundary. Its payload carries the turn, which
+    //    is what makes this trigger and the poll agree on the same turn.
+    const disposeStopping = agent.ctx.on("agent/turn-stopping", (payload) => {
+      schedule("stopping", payload?.turn);
     });
 
     return () => {
@@ -641,17 +649,43 @@ export function apply(ctx, rawConfig) {
   const predictionUserSeq = new Map();
   const predictionTurnKey = new Map();
 
-  function predictionBoundary(session) {
+  /**
+   * The newest submission sequence, and which turn the log tail describes.
+   *
+   * `turn` is the turn NUMBER, never a sequence number. A sequence number of
+   * `turn/end` changes the instant that event is appended, so the event trigger
+   * and the polling fallback disagreed about which turn they were looking at and
+   * billed the same one twice. The number is final for the whole turn.
+   *
+   * While a turn is running its `turn/end` does not exist yet, so the closed turn
+   * plus one is the open one. That is how a trigger without a turn in its own
+   * payload (notably `agent/status`) still names the same turn the poll will.
+   */
+  function logBoundary(session) {
     let lastUser = -1;
-    let lastTurn = -1;
+    let closed = 0;
+    let closedSeq = -1;
+    let started = 0;
     for (let seq = Math.max(0, session.seq - 400); seq < session.seq; seq += 1) {
-      const type = session.eventAt(seq)?.type;
-      if (type === "user/message") lastUser = seq;
-      if (type === "turn/end") lastTurn = seq;
+      const event = session.eventAt(seq);
+      if (event === undefined) continue;
+      if (event.type === "user/message") {
+        lastUser = seq;
+        continue;
+      }
+      if (event.type !== "turn/start" && event.type !== "turn/end") continue;
+      const seen = event.data?.turn;
+      if (!Number.isInteger(seen)) continue;
+      if (seen > started) started = seen;
+      if (event.type === "turn/end" && seen >= closed) {
+        closed = seen;
+        closedSeq = seq;
+      }
     }
-    // The same submission may emit idle before turn/end is persisted. Keying
-    // on both events would charge twice when the later event arrives.
-    return { lastUser, key: lastUser >= 0 ? `user:${lastUser}` : lastTurn >= 0 ? `turn:${lastTurn}` : undefined };
+    // A submission newer than the last closed turn means that turn is running.
+    const running = lastUser > closedSeq;
+    const turn = running ? Math.max(started, closed + 1) : Math.max(started, closed);
+    return { lastUser, turn };
   }
 
   /** Invalidate in-flight predictions and forget anything pending for a session. */
@@ -671,16 +705,26 @@ export function apply(ctx, rawConfig) {
   }
 
   /** Ask for a prediction for one agent, superseding any in-flight one. */
-  function runPrediction(agent, sessionId) {
+  function runPrediction(agent, sessionId, turnHint) {
     if (!live.enabled) return;
+    // Resolve the turn that is about to be predicted for. Triggers that know it
+    // pass it; the rest recover it from the log. `turn/start` is appended before
+    // the turn runs, so a completed turn is always readable here even after its
+    // `user/message` has slid out of the 400-event window.
+    let turn = Number.isInteger(turnHint) ? turnHint : 0;
     try {
-      const boundary = predictionBoundary(agent.session);
-      if (boundary.key !== undefined && predictionTurnKey.get(sessionId) === boundary.key) return;
-      if (boundary.key !== undefined) predictionTurnKey.set(sessionId, boundary.key);
+      const boundary = logBoundary(agent.session);
+      if (boundary.turn > turn) turn = boundary.turn;
       predictionUserSeq.set(sessionId, boundary.lastUser);
     } catch {
       predictionUserSeq.delete(sessionId);
-      predictionTurnKey.delete(sessionId);
+    }
+    // One prediction per turn, whichever trigger speaks first. This is the only
+    // thing that stops the event trigger and the polling fallback from charging
+    // the same turn twice; returning here spends nothing.
+    if (turn > 0) {
+      if (predictionTurnKey.get(sessionId) === turn) return;
+      predictionTurnKey.set(sessionId, turn);
     }
     // A new turn begins here, so whatever was recallable belongs to the previous
     // exchange. Keeping it would let the accepted-then-sent line resurface as the
@@ -845,7 +889,7 @@ export function apply(ctx, rawConfig) {
       if (lastTurnReason === "aborted" || lastTurnReason === "interrupted" || lastTurnReason === "forked") continue;
       diagnostics.turnEnd += 1;
       diagnostics.lastAt = Date.now();
-      runPrediction(agent, sessionId);
+      runPrediction(agent, sessionId, lastTurn);
     }
   }, 2000);
   if (typeof poll.unref === "function") poll.unref();
