@@ -638,19 +638,20 @@ export function apply(ctx, rawConfig) {
   const dropEpoch = new Map();
   // The polling fallback can observe a submission after a fast prediction for
   // that same completed turn has already started or finished.
-  const predictionUserCount = new Map();
+  const predictionUserSeq = new Map();
   const predictionTurnKey = new Map();
 
   function predictionBoundary(session) {
-    let count = 0;
     let lastUser = -1;
     let lastTurn = -1;
     for (let seq = Math.max(0, session.seq - 400); seq < session.seq; seq += 1) {
       const type = session.eventAt(seq)?.type;
-      if (type === "user/message") { count += 1; lastUser = seq; }
+      if (type === "user/message") lastUser = seq;
       if (type === "turn/end") lastTurn = seq;
     }
-    return { count, key: lastUser < 0 && lastTurn < 0 ? undefined : `${lastUser}:${lastTurn}` };
+    // The same submission may emit idle before turn/end is persisted. Keying
+    // on both events would charge twice when the later event arrives.
+    return { lastUser, key: lastUser >= 0 ? `user:${lastUser}` : lastTurn >= 0 ? `turn:${lastTurn}` : undefined };
   }
 
   /** Invalidate in-flight predictions and forget anything pending for a session. */
@@ -676,9 +677,9 @@ export function apply(ctx, rawConfig) {
       const boundary = predictionBoundary(agent.session);
       if (boundary.key !== undefined && predictionTurnKey.get(sessionId) === boundary.key) return;
       if (boundary.key !== undefined) predictionTurnKey.set(sessionId, boundary.key);
-      predictionUserCount.set(sessionId, boundary.count);
+      predictionUserSeq.set(sessionId, boundary.lastUser);
     } catch {
-      predictionUserCount.delete(sessionId);
+      predictionUserSeq.delete(sessionId);
       predictionTurnKey.delete(sessionId);
     }
     // A new turn begins here, so whatever was recallable belongs to the previous
@@ -776,8 +777,8 @@ export function apply(ctx, rawConfig) {
   // Cost is one numeric comparison every two seconds while a session is live,
   // and nothing at all once its turn is unchanged.
   const lastSeen = new Map();
-  /** Count of user messages seen per session, to detect a submission. */
-  const lastUserCount = new Map();
+  /** Last observed user-message sequence, independent of the sliding window. */
+  const lastUserSeq = new Map();
   const poll = setInterval(() => {
     if (!live.enabled) return;
     let agents;
@@ -798,10 +799,9 @@ export function apply(ctx, rawConfig) {
           continue;
         }
       }
-      let turnEnds = 0;
       let lastTurn = -1;
       let lastTurnReason = null;
-      let userMessages = 0;
+      let lastUser = -1;
       try {
         const session = agent.session;
         // Walk the tail only: turn/end records are sparse and recent.
@@ -810,11 +810,10 @@ export function apply(ctx, rawConfig) {
           const event = session.eventAt(seq);
           if (event === undefined) continue;
           if (event.type === "turn/end") {
-            turnEnds += 1;
             lastTurn = event.data?.turn ?? lastTurn;
             lastTurnReason = event.data?.reason?.kind ?? null;
           } else if (event.type === "user/message") {
-            userMessages += 1;
+            lastUser = seq;
           }
         }
       } catch {
@@ -826,17 +825,12 @@ export function apply(ctx, rawConfig) {
       // that just closed as already handled. This is the authoritative version
       // of the signal: it does not depend on the Client reporting its phase,
       // which may never change in some composer states.
-      const previousUsers = lastUserCount.get(sessionId);
-      lastUserCount.set(sessionId, userMessages);
-      if (previousUsers !== undefined && userMessages > previousUsers) {
+      const previousUsers = lastUserSeq.get(sessionId);
+      lastUserSeq.set(sessionId, lastUser);
+      if (previousUsers !== undefined && lastUser > previousUsers) {
         // A prediction already based on this submission is fresh. Only cancel
         // work that started before the newly observed user message.
-        if ((predictionUserCount.get(sessionId) ?? -1) < userMessages) consumePending(sessionId);
-        // Advance the baseline so the turn that ended alongside this submission
-        // does not immediately produce a suggestion for a conversation the user
-        // has already moved past.
-        lastSeen.set(sessionId, lastTurn);
-        continue;
+        if ((predictionUserSeq.get(sessionId) ?? -1) < lastUser) consumePending(sessionId);
       }
 
       const previous = lastSeen.get(sessionId);
@@ -1075,9 +1069,9 @@ export function apply(ctx, rawConfig) {
   ctx.effect(() => () => {
     clearInterval(poll);
     lastSeen.clear();
-    lastUserCount.clear();
+    lastUserSeq.clear();
     dropEpoch.clear();
-    predictionUserCount.clear();
+    predictionUserSeq.clear();
     predictionTurnKey.clear();
     offCreated();
     offDisposed();

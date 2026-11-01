@@ -94,6 +94,42 @@ test('an event and a later polling observation of the same turn make only one pr
   } finally { h.dispose(); }
 });
 
+test('polling triggers a completed turn even when submission and completion arrive together', async () => {
+  const events = [{ type: 'user/message' }, { type: 'turn/end', data: { turn: 1 } }];
+  const h = harness({ events });
+  try {
+    h.poll();
+    events.push({ type: 'user/message' }, { type: 'turn/end', data: { turn: 2 } });
+    h.poll(); await delay(10);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
+  } finally { h.dispose(); }
+});
+
+test('a new user message invalidates old work even as the 400-event window slides', async () => {
+  const events = [{ type: 'user/message' }, ...Array.from({ length: 399 }, () => ({}))];
+  const h = harness({ events });
+  try {
+    h.poll(); h.trigger(); await delay(450);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
+    events.push({ type: 'user/message' });
+    h.poll();
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion, null);
+  } finally { h.dispose(); }
+});
+
+test('idle before turn/end and polling afterwards do not generate twice', async () => {
+  const events = [{ type: 'user/message' }, { type: 'turn/end', data: { turn: 1 } }];
+  let calls = 0;
+  const h = harness({ events, stream: async function* () { calls++; yield { type: 'text-delta', text: 'Test suggestion' }; } });
+  try {
+    h.poll(); events.push({ type: 'user/message' }); h.poll();
+    h.trigger(); await delay(450);
+    events.push({ type: 'turn/end', data: { turn: 2 } });
+    h.poll(); await delay(10);
+    assert.equal(calls, 1);
+  } finally { h.dispose(); }
+});
+
 test('settings and learned feedback survive disposal and reload', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-predict-test-'));
   const previous = process.env.DSH_PROFILE_DIR;
