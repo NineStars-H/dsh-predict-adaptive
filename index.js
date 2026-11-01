@@ -845,6 +845,7 @@ export function apply(ctx, rawConfig) {
       }
       let lastTurn = -1;
       let lastTurnReason = null;
+      let lastTurnSeq = -1;
       let lastUser = -1;
       try {
         const session = agent.session;
@@ -856,6 +857,7 @@ export function apply(ctx, rawConfig) {
           if (event.type === "turn/end") {
             lastTurn = event.data?.turn ?? lastTurn;
             lastTurnReason = event.data?.reason?.kind ?? null;
+            lastTurnSeq = seq;
           } else if (event.type === "user/message") {
             lastUser = seq;
           }
@@ -865,13 +867,13 @@ export function apply(ctx, rawConfig) {
       }
 
       // A new user message means the composer was submitted. Whatever was
-      // pending belongs to the previous composer, so drop it and treat the turn
-      // that just closed as already handled. This is the authoritative version
-      // of the signal: it does not depend on the Client reporting its phase,
-      // which may never change in some composer states.
+      // pending belongs to the previous composer, so drop it. This is the
+      // authoritative version of the signal: it does not depend on the Client
+      // reporting its phase, which may never change in some composer states.
       const previousUsers = lastUserSeq.get(sessionId);
       lastUserSeq.set(sessionId, lastUser);
-      if (previousUsers !== undefined && lastUser > previousUsers) {
+      const submitted = previousUsers !== undefined && lastUser > previousUsers;
+      if (submitted) {
         // A prediction already based on this submission is fresh. Only cancel
         // work that started before the newly observed user message.
         if ((predictionUserSeq.get(sessionId) ?? -1) < lastUser) consumePending(sessionId);
@@ -883,6 +885,16 @@ export function apply(ctx, rawConfig) {
       // that completed while we were watching.
       if (previous === undefined) continue;
       if (lastTurn <= previous) continue;
+      // The user sent their own message AFTER this turn closed instead of
+      // taking the suggestion: they have moved past it, so predicting its
+      // successor would paint a stale ghost over the freshly emptied composer
+      // and bill another model call for it. That ordering is exactly what makes
+      // the ghost seem to "come back" right after a send.
+      //
+      // A submission that arrived BEFORE the turn closed is the opposite case —
+      // it is the turn that just finished being answered — and must still be
+      // predicted for.
+      if (submitted && lastUser > lastTurnSeq) continue;
       // A turn the user stopped, interrupted, or forked is not a conversation
       // waiting for its next line: they took over deliberately. Suggesting
       // anything there reads as nagging, so stay quiet.

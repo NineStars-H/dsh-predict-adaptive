@@ -131,6 +131,31 @@ test('idle before turn/end and polling afterwards do not generate twice', async 
   } finally { h.dispose(); }
 });
 
+test('sending after a turn closed does not bring the ghost back', async () => {
+  // The plugin is already watching while turn 1 runs, so its baseline is
+  // recorded BEFORE turn 1 closes. Then: turn 1 ends, the event trigger
+  // predicts for it, and the user ignores the suggestion and sends their own
+  // message. The next poll sees both the completed turn and the new submission;
+  // it must not bill a second prediction whose draft would paint over the
+  // freshly emptied composer and sit there until the user speaks again.
+  const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'user/message' }];
+  let calls = 0;
+  const h = harness({ events, stream: async function* () { calls++; yield { type: 'text-delta', text: `draft ${calls}` }; } });
+  try {
+    h.poll(); await delay(10);
+    // Turn 1 closes while the plugin is watching.
+    events.push({ type: 'turn/end', data: { turn: 1 } });
+    h.stopping(1); await delay(450);
+    assert.equal(calls, 1, 'the completed turn is predicted once');
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'draft 1');
+    // The user sends their own message instead of taking it.
+    events.push({ type: 'turn/start', data: { turn: 2 } }, { type: 'user/message' });
+    h.poll(); await delay(20);
+    assert.equal(calls, 1, 'the abandoned turn is not predicted again');
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion, null, 'the ghost stays gone');
+  } finally { h.dispose(); }
+});
+
 test('a long turn bills once even after its user message leaves the scan window', async () => {
   // A tool-heavy turn appends enough events that the `user/message` that opened
   // it is no longer inside the 400-event tail the boundary scan reads. The turn
