@@ -57,13 +57,36 @@ if (routed === undefined || !routed.provider || !routed.model) {
 
 ## 安装
 
-```bash
-dsh plugin add dsh-prompt-predict-adaptive
+本插件**没有发布到 npm**，请从 GitHub 安装。
+
+在 Harness 的**设置 → 插件 → 添加插件**中选「Git 仓库」，填入：
+
+```
+https://github.com/NineStars-H/dsh-predict-adaptive
 ```
 
-或在 Harness 的**设置 → 插件 → 添加插件**中填入包名。
+也可以直接填本地克隆目录的绝对路径（选「本地目录」）。
 
-安装后刷新页面。
+安装后**刷新页面**。
+
+### 从本地目录切换到 Git 安装时会报 EPERM
+
+Windows 上如果你的插件此前是用「本地目录」装的，pnpm 会在 profile 的
+`node_modules` 里留一个 **junction** 指向那个目录。再次从 Git 安装时，pnpm 无法
+重命名覆盖它，会报：
+
+```
+ERR_PNPM_EPERM  rename '...dsh-prompt-predict-adaptive_tmp_...' -> '...dsh-prompt-predict-adaptive'
+```
+
+先在插件页**卸载**，再手动删除这个 junction（`rmdir` 不会递归，是安全的）：
+
+```powershell
+$env:DSH_PROFILE_DIR ?? "$env:USERPROFILE\.dsh\profiles\desktop"
+cmd /c rmdir "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-prompt-predict-adaptive"
+```
+
+然后重新安装即可。
 
 ## 配置
 
