@@ -493,26 +493,24 @@ test('the ghost disappears the moment a submission starts', async () => {
   }
 });
 
-test('a long suggestion is clamped instead of overflowing the composer', async () => {
-  // The host anchors overlays at a zero-height seat, so anything taller than the
-  // composer overflows the card rather than growing it. The host's own placeholder
-  // avoids this by never wrapping (`white-space: nowrap` + ellipsis). The ghost
-  // clamps to three lines instead: long enough to be worth reading, short enough
-  // to stay inside the reserved height.
+test('a long suggestion is clamped to two lines instead of overflowing', async () => {
+  // The host anchors overlays at a zero-height seat, so the ghost takes no part in
+  // layout and cannot grow the card. Anything past the second line would cover the
+  // toolbar underneath, so the text clamps to two lines with an ellipsis.
   const long = Array.from({ length: 12 }, (_, i) => `line ${i + 1} of the suggestion`).join('\n');
   const app = await mount({ suggestion: { text: long, at: 2_000 } });
   try {
     const text = app.textStyle();
-    assert.equal(text.WebkitLineClamp, '3', 'clamped to three lines');
+    assert.equal(text.WebkitLineClamp, '2', 'clamped to two lines');
     assert.equal(text.display, '-webkit-box', 'the clamp needs a box display');
     assert.equal(text.overflow, 'hidden', 'and must actually clip');
+    assert.equal(text.textOverflow, 'ellipsis', 'the cut is marked, not silent');
 
     // The row must stay a row: the clamp lives on the text, not the container, or
     // the Tab badge would be swallowed by the box.
     const row = app.rowStyle();
     assert.equal(row.display, 'flex');
-    assert.equal(row.overflow, 'hidden');
-    assert.ok(row.maxHeight.includes('--dsh-composer-text-max-height'), 'bounded by the host budget');
+    assert.equal(row.position, 'absolute', 'anchored like the host placeholder');
 
     // The text is still complete in the DOM, so Tab can insert all of it.
     assert.equal(app.shownText(), long);

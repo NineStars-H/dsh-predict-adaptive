@@ -124,10 +124,16 @@ window.__ModuleLoader__.load({
       },
       ghost: {
         position: 'absolute',
-        // 8px card padding-top + 4px editor padding-top.
-        top: '12px',
-        // The editor's own left padding, so the ghost starts on the same column
-        // as typed text.
+        /*
+         * Exactly the host placeholder's own box.
+         *
+         * `.placeholder` is `inset: 4px 8px auto 14px` inside the editor's growing
+         * box, so the suggestion occupies the same rectangle the official text
+         * would. The anchor this renders into is the composer card, whose top
+         * padding is 8px, so the vertical inset is offset by that to land on the
+         * same row rather than 8px lower.
+         */
+        top: '12px', // card padding-top (8px) + placeholder top (4px)
         left: '14px',
         right: '8px',
         font: 'inherit',
@@ -146,29 +152,23 @@ window.__ModuleLoader__.load({
         display: 'flex',
         alignItems: 'flex-start',
         gap: '6px',
-        // Never taller than the space the composer reserves, whatever the text.
-        maxHeight: 'calc(var(--dsh-composer-text-max-height, 336px) / 3)',
-        overflow: 'hidden',
       },
       /*
-       * Clamp the suggestion itself to three lines, the way the host's placeholder
-       * behaves.
+       * Clamp the suggestion to two lines, ellipsis on the third.
        *
-       * That placeholder is `white-space: nowrap` with `text-overflow: ellipsis`,
-       * so the official line can never wrap; a wrapped ghost would be taller than
-       * the composer it sits in and, because the anchor is a zero-height absolutely
-       * positioned seat, would overflow the card instead of growing it.
+       * Two lines is what fits the space the empty composer already occupies: the
+       * anchor this sits in is `height: 0; position: absolute`, so the ghost takes
+       * no part in layout and cannot grow the card — anything past the second line
+       * would cover the toolbar underneath rather than extending the box.
        *
-       * Three lines is a readable preview that fits the height already reserved, so
-       * the card never has to change size. The full text is one keypress away: Tab
-       * puts all of it into the composer.
+       * The full text is one keypress away: Tab puts all of it into the composer.
        */
       ghostText: {
         minWidth: 0,
         flex: '1 1 auto',
         display: '-webkit-box',
         WebkitBoxOrient: 'vertical',
-        WebkitLineClamp: '3',
+        WebkitLineClamp: '2',
         overflow: 'hidden',
         textOverflow: 'ellipsis',
       },
