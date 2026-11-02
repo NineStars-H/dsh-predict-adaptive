@@ -50,43 +50,32 @@ const PLUGIN_VERSION = (() => {
 })();
 
 /**
- * The directive. It is appended as the FINAL user message after the replayed
- * conversation, so the auxiliary call is a genuine prefix of the last routed
- * request and the provider's prefix cache stays warm.
+ * The directive.
  *
- * Wording follows what actually produced useful drafts in practice: name the
- * concrete next action, keep the user's own language, and refuse to invent a
- * suggestion when the conversation has no obvious continuation.
+ * Sent as the single user message, above the transcript. There is no reusable
+ * prefix here to keep warm: every prediction is one self-contained message built
+ * from scratch, so this text costs one prompt per call and nothing is cached
+ * across calls. That is also why it is kept short.
+ *
+ * Phrased as a description of the voice rather than a list of bans. Rules that
+ * only say "never do X" leave the shape of X in the prompt, and the model tends
+ * to reproduce what it has just been told about.
  */
 const INSTRUCTION = [
-  "You are completing a text field, not writing an answer.",
+  "Complete the message the user is about to type.",
   "",
-  "The last line of the transcript is the assistant's reply. Imagine the user has just read it and their cursor is blinking in the message box. Complete the message THEY are about to type.",
+  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and their cursor is in the message box; write the line they are typing next, and stop.",
   "",
-  "You are the user. You are not an assistant, not an analyst, and not describing the conversation. If a sentence could be read as instructions handed TO the user by someone else, it is wrong.",
+  "It is their own words: the thing they want done, in their register — the words they wrap around a command, or the part they typed before pasting the error.",
   "",
-  "Hard constraints:",
-  "- Output plain text only. Do NOT emit tool calls, function calls, XML/DSML tags, JSON, or any protocol markup.",
-  "- Do NOT continue the conversation, do NOT answer the user, do NOT write as the ASSISTANT.",
-  "- Do NOT comment on this instruction or on the transcript.",
-  "- There is no tool available to you. Do not attempt to use one.",
-  "- Never write a to-do list, a checklist, an imperative plan, or a summary of what should happen next. That is the assistant's voice, not the user's.",
+  "What reads as a prediction:",
+  "- One sentence, often shorter. Their follow-ups are usually terse.",
+  "- Concrete: a file, a command, a check, a decision — something from this conversation.",
+  "- Same language they have been writing in.",
+  "- They may be impatient, pleased, or cutting the assistant off. Tone is part of the line.",
   "",
-  "Content rules:",
-  "- Write in the same language the USER has been using.",
-  "- Phrase it as the USER speaking: imperative, first person.",
-  "- Prefer the most probable CONCRETE next step: run the tests, fix that failure, commit it, verify a specific file, continue the plan.",
-  "- If the transcript left a specific unresolved item (a failing check, an unverified claim, an unfinished step), name it together with the exact file or command.",
-  "- One line. One sentence is ideal; a second sentence is allowed only when naming files is what makes it useful.",
-  "- No preamble, no quotes, no bullets, no explanation, no markdown fence.",
-  "",
-  "Grounding rules — a draft that breaks these is worse than no draft:",
-  "- Only refer to things that actually appear in the transcript: files, commands, errors, decisions. Never invent a file name, a path, a test name, a number, or a claim the transcript does not contain.",
-  "- Do not describe what the ASSISTANT did, and do not restate or summarise the conversation back to the user.",
-  "- Do not repeat the assistant's own suggestions back at it. If the assistant just listed things to check, the user does not read that list aloud.",
-  "- Do not propose a plan the user never hinted at. Continue THEIR direction, not a plausible-sounding one of your own.",
-  "- If the transcript is small talk, a bare acknowledgement, or has no open thread, output exactly: NO_PREDICTION",
-  "- Before answering, check each concrete detail in your draft against the transcript. Drop anything you cannot point to.",
+  "Output their line and nothing else: no framing, no quotation marks, no list, no markdown.",
+  "When the conversation has no open thread — small talk, a closing thanks, nothing left to do — answer NO_PREDICTION.",
   "",
   "=== TRANSCRIPT ===",
 ].join("\n");
