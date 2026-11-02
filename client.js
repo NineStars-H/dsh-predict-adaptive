@@ -210,6 +210,11 @@ window.__ModuleLoader__.load({
       // can be recognised as "an accept, then the field emptied" rather than a
       // send. It is a hint for the Host, which decides from the session log.
       const acceptPendingRef = React.useRef(null);
+      // Set once a submission has been observed, and cleared only when the composer
+      // is provably a new one. The submission echo is transient, so remembering it
+      // in state is what stops the ghost blinking back between the send and the
+      // next Host reply: a ref would change the flag without a repaint.
+      const [sent, setSent] = React.useState(false);
 
       const refreshRef = React.useRef(null);
       const refresh = React.useCallback(() => {
@@ -289,6 +294,8 @@ window.__ModuleLoader__.load({
         // suggestion: hide on the same frame the user pressed send, instead of
         // waiting for the Host to answer and retire the draft.
         pending === 0 &&
+        // And stay hidden after the echo retires, until the composer is new.
+        !sent &&
         phase !== 'submitting' &&
         phase !== 'adjudicating';
 
@@ -361,6 +368,21 @@ window.__ModuleLoader__.load({
           .catch(() => {});
       }, [show, candidate, sessionId, refresh]);
 
+      // A submission was observed. Latch it until the Host's answer proves the
+      // composer is a new one, because the echo that reveals a send is transient:
+      // it retires as soon as the transcript adopts the message, which is before
+      // the next poll. Watching only the echo made the ghost blink — hidden while
+      // it was live, repainted when it retired, then gone again on the poll.
+      //
+      // The latch is cleared only by evidence of a NEW composer: a Host reply that
+      // reports a fresh suggestion, or the user typing again.
+      React.useEffect(() => {
+        if (pending === 0) return;
+        setSent(true);
+        setEntry(null);
+        setRing([]);
+      }, [pending]);
+
       // The composer went from non-empty to empty. Three events look identical
       // from here — a send, a Tab-then-clear, and typing something and deleting
       // it — and the Client has no way to tell them apart: `InputState.phase`
@@ -376,6 +398,8 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         const before = previousDraft.current;
         previousDraft.current = draft;
+        // Typing again means a new composer, so a previous send no longer applies.
+        if (draft.length > 0 && sent) setSent(false);
         if (before.length === 0 || draft.length > 0) return;
         acceptPendingRef.current = null;
         setEntry(null);
@@ -388,7 +412,7 @@ window.__ModuleLoader__.load({
         })
           .then(() => refresh())
           .catch(() => {});
-      }, [draft, sessionId, refresh]);
+      }, [draft, sent, sessionId, refresh]);
 
       // Key handling lives for the whole component. A listener tied to "a
       // suggestion is on screen" unmounted with the ghost, so the next Escape
@@ -716,3 +740,4 @@ window.__ModuleLoader__.load({
     };
   },
 });
+

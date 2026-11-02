@@ -73,6 +73,8 @@ async function mount({
     consumedAt,
   };
   void hostState;
+  /** The live submission echo list; a test may change it to model a retirement. */
+  let pendingNow = pending;
   /** Timers the component scheduled; the poll loop is driven by these. */
   const timers = [];
 
@@ -201,7 +203,7 @@ async function mount({
         inputActions: { captureInsertion: () => ({}), insertText: () => true, setDraft: () => {} },
         useInput: (selector) => selector({ draft, phase, attachmentIds: [], draftRev: 0 }),
         // The live submission list: non-empty means a send is in flight.
-        useSession: (selector) => selector({ pendingSubmissions: pending }),
+        useSession: (selector) => selector({ pendingSubmissions: pendingNow }),
       });
     } finally {
       rendering = false;
@@ -246,6 +248,8 @@ async function mount({
     shownText,
     placeholderVisibility: () => placeholderNode.style.visibility,
     setHostReply: (next) => { hostReply = next; },
+    /** Replace the live submission echo list, as the session does when it retires. */
+    setPending: (next) => { pendingNow = next; scheduleRender(); },
     advanceClock: (ms) => { clock += ms; },
     press(key) {
       const event = {
@@ -400,6 +404,28 @@ test('a line produced before the last send is not painted after a remount', asyn
   });
   try {
     assert.equal(app.shownText(), null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('the ghost does not blink back after the submission echo retires', async () => {
+  // Pressing send hides it, then the Host adopts the message and the local echo
+  // retires. If the visibility rule only watched the echo, that retirement would
+  // paint the old draft again until the next poll dropped it — a visible blink.
+  // The send therefore also has to record that this composer is finished with.
+  const app = await mount({
+    suggestion: { text: 'run the tests', at: 2_000 },
+    pending: [{ requestId: 'r1', placement: 'transcript', text: 'run the tests' }],
+  });
+  try {
+    assert.equal(app.tree, null, 'hidden while the echo is live');
+
+    // The echo retires: the list empties, but the Host has not answered the poll
+    // yet and still reports the old draft.
+    app.setPending([]);
+    await app.settle();
+    assert.equal(app.shownText(), null, 'it must not blink back');
   } finally {
     await app.dispose();
   }
