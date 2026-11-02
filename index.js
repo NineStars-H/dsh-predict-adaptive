@@ -114,11 +114,10 @@ function resolveConfig(raw) {
   // Both default on: they make a draft more actionable, and each can be turned
   // off from the plugin page when the extra prompt or the delay is unwanted.
   const workspace = source.workspace !== false;
-  const permissions = source.permissions !== false;
   // Off by default: the diagnose endpoint spends a model call and forwards the
   // transcript, so it is opt-in for debugging only.
   const diagnostics = source.diagnostics === true;
-  return { enabled: source.enabled !== false, mode, recentTurns, adaptive, workspace, permissions, diagnostics };
+  return { enabled: source.enabled !== false, mode, recentTurns, adaptive, workspace, diagnostics };
 }
 
 /**
@@ -454,41 +453,6 @@ function workspaceText(ctx, agent) {
 }
 
 /**
- * Report the permissions this session is running under.
- *
- * The prediction request inherits the session's route already; stating the
- * sandbox and approval posture lets the model avoid suggesting an action the
- * session could not take (a write under read-only, a run under `never`).
- *
- * @param ctx - Host context supplying the optional policy services.
- * @param agent - session whose logged overrides are read.
- * @returns a short block of text, or an empty string when neither service runs.
- */
-function permissionText(ctx, agent) {
-  const parts = [];
-  const sandbox = ctx.get("sandboxPolicy");
-  if (sandbox !== undefined) {
-    try {
-      const policy = sandbox.resolve({ session: agent.session });
-      parts.push(`sandbox: ${policy.mode}`);
-    } catch {
-      /* a policy that cannot be resolved is simply not reported */
-    }
-  }
-  const approval = ctx.get("approval");
-  if (approval !== undefined) {
-    try {
-      const policy = approval.overrideOf(agent.session);
-      if (policy !== undefined) parts.push(`approval: ${policy}`);
-    } catch {
-      /* same: omit rather than guess */
-    }
-  }
-  if (parts.length === 0) return "";
-  return `\n\n=== SESSION PERMISSIONS ===\n${parts.join("\n")}\nDo not suggest an action these permissions forbid.`;
-}
-
-/**
  * Ask one routed model for the next user message.
  *
  * @param ctx - Host context supplying the LLM service.
@@ -527,12 +491,23 @@ async function predict(ctx, agent, config, feedback, signal) {
   // Workspace state is opt-in: it sharpens the draft at the cost of a longer
   // prompt, and some users would rather keep the call purely conversational.
   const workspace = config.workspace === false ? "" : workspaceText(ctx, agent);
-  const permissions = config.permissions === false ? "" : permissionText(ctx, agent);
+  /*
+   * No permission block.
+   *
+   * There used to be one, describing the session's sandbox and approval posture.
+   * It could not do anything: a prediction never runs a tool, so the posture never
+   * limits what the model can produce — it only told the model that certain
+   * actions were unavailable, which pushed drafts toward hedging ("看看能不能改")
+   * instead of the thing the user actually wants to say.
+   *
+   * Read-only is a property of the call itself, not a policy to declare: the
+   * request carries `tools: []` and its reply is only ever shown as text.
+   */
   const request = {
     provider: routed.provider,
     model: routed.model,
     messages: [
-      { role: "user", content: [{ type: "text", text: `${instruction}${workspace}${permissions}\n${transcript}` }] },
+      { role: "user", content: [{ type: "text", text: `${instruction}${workspace}\n${transcript}` }] },
     ],
     // Declared empty rather than omitted, which is what Codex's own implementation
     // sends. Omission leaves the adapter free to fall back to the session's tool
@@ -1633,7 +1608,6 @@ export function apply(ctx, rawConfig) {
           if (typeof body.enabled === "boolean") live.enabled = body.enabled;
           if (typeof body.adaptive === "boolean") live.adaptive = body.adaptive;
           if (typeof body.workspace === "boolean") live.workspace = body.workspace;
-          if (typeof body.permissions === "boolean") live.permissions = body.permissions;
           if (typeof body.diagnostics === "boolean") live.diagnostics = body.diagnostics;
           persist();
           return send(200, { ok: true, config: { ...live } });
@@ -1839,13 +1813,14 @@ export const DEFAULT_CONFIG = {
   enabled: true,
   adaptive: true,
   workspace: true,
-  permissions: true,
   diagnostics: false,
   mode: "full",
   recentTurns: 6,
 };
 
 export default { apply, inject };
+
+
 
 
 

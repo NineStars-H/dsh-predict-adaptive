@@ -62,8 +62,6 @@ window.__ModuleLoader__.load({
         adaptiveHint: '从你采纳或丢弃的草稿里学习措辞。关闭后行为与基础版完全一致。',
         workspaceLabel: '并入工作区状态',
         workspaceHint: '把本会话改过的文件清单加入预测上下文，让建议能点名具体文件。',
-        permissionsLabel: '继承会话权限',
-        permissionsHint: '告知预测当前沙箱与审批状态，避免建议出无权执行的动作。',
         learnedLabel: '学习状态',
         learnedHint: '已采纳 / 已丢弃的草稿会用于调整后续预测。',
         usageLabel: '预测消耗',
@@ -103,8 +101,6 @@ window.__ModuleLoader__.load({
         adaptiveHint: 'Learn phrasing from the drafts you accept or dismiss. Off behaves exactly like the plain build.',
         workspaceLabel: 'Include workspace state',
         workspaceHint: 'Add this session\u2019s changed files to the prediction, so a draft can name exact paths.',
-        permissionsLabel: 'Inherit session permissions',
-        permissionsHint: 'Tell the prediction the sandbox and approval posture, so it avoids impossible actions.',
         learnedLabel: 'Learned steering',
         learnedHint: 'Accepted / dismissed drafts steer later predictions.',
         usageLabel: 'Prediction cost',
@@ -684,7 +680,7 @@ window.__ModuleLoader__.load({
         if (next && history === null) void loadHistory();
       };
 
-      const FIELDS = ['enabled', 'adaptive', 'workspace', 'permissions', 'mode', 'recentTurns'];
+      const FIELDS = ['enabled', 'adaptive', 'workspace', 'mode', 'recentTurns'];
       const dirty =
         saved !== null && draft !== null && FIELDS.some((key) => saved[key] !== draft[key]);
       const busy = status === 'saving';
@@ -701,7 +697,6 @@ window.__ModuleLoader__.load({
               enabled: draft.enabled,
               adaptive: draft.adaptive,
               workspace: draft.workspace,
-              permissions: draft.permissions,
               mode: draft.mode,
               recentTurns: draft.recentTurns,
             }),
@@ -764,11 +759,6 @@ window.__ModuleLoader__.load({
         row(t.toggleLabel, t.toggleHint, checkbox(draft.enabled !== false, (next) => patch({ enabled: next }))),
         row(t.adaptiveLabel, t.adaptiveHint, checkbox(draft.adaptive !== false, (next) => patch({ adaptive: next }))),
         row(t.workspaceLabel, t.workspaceHint, checkbox(draft.workspace !== false, (next) => patch({ workspace: next }))),
-        row(
-          t.permissionsLabel,
-          t.permissionsHint,
-          checkbox(draft.permissions !== false, (next) => patch({ permissions: next })),
-        ),
         row(
           t.contextLabel,
           t.contextHint,
@@ -1112,6 +1102,7 @@ window.__ModuleLoader__.load({
     };
   },
 });
+
 
 
 
