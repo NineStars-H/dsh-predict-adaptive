@@ -91,6 +91,24 @@ const INSTRUCTION = [
   "- Same language they have been writing in.",
   "- They may be impatient, pleased, confused, or cutting the assistant off. Tone is part of the line.",
   "",
+  /*
+   * The part that matters most, and the easiest to get wrong.
+   *
+   * An agent often ends a turn by asking for something the user may not know how to
+   * answer: a config choice, a tool, a term. The obvious failure is to write an
+   * explanation of that question — it reads like help, but Tab sends it, and the
+   * agent receives a paragraph of commentary instead of an instruction.
+   *
+   * So the rule is not "explain more". It is "answer for them, in their voice".
+   */
+  "When the reply asks the user to choose, configure, or approve something technical:",
+  "- Work out what the assistant actually needs before it can continue, then write the instruction that supplies it. The user's goal is to keep the work moving, not to understand the question.",
+  "- If the assistant can reasonably decide or check it itself, that IS the right message: tell it to go ahead and use its judgement.",
+  "- When the choice genuinely needs the user — something irreversible, an external system, money, or a trade-off only they can weigh — name one option and say why, rather than listing the options back.",
+  "- Never restate the question or explain the term. The draft is a message to the assistant, not a note to the user.",
+  "- Do not invent settings, file names, versions or facts to fill a gap. Ask the assistant to check when you do not know.",
+  "- Ordinary conversation stays ordinary: most turns are not a technical decision, and a chat reply should still read like one.",
+  "",
   "Reply with JSON and nothing else:",
   '  {"suggestion": "<their next message>"}',
   "  {\"suggestion\": null}   when they have nothing left to say here",
