@@ -109,9 +109,6 @@ window.__ModuleLoader__.load({
         learnedHint: 'Accepted / dismissed drafts steer later predictions.',
         usageLabel: 'Prediction cost',
         usageHint: 'Every finished turn starts one prediction request. This is the token usage it has cost so far; the recent window is listed separately so one turn\u2019s cost can be estimated.',
-        usageCalls: 'Calls',
-        usageRecent: 'Recent',
-        usageTotal: 'Total',
         usageUnmetered: 'calls reported no usage',
         usageReset: 'Reset counter',
         usageEmpty: 'No predictions yet.',
@@ -1115,6 +1112,7 @@ window.__ModuleLoader__.load({
     };
   },
 });
+
 
 
 

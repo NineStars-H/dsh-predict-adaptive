@@ -226,6 +226,34 @@ test('a round that produced nothing is logged too', async () => {
   } finally { h.dispose(); }
 });
 
+test('a multi-sentence reply is kept whole instead of truncated to its first line', async () => {
+  // The filter used to split on newlines and return the first passing line, which
+  // silently clipped every suggestion to its opening clause. The instruction asks
+  // for "their own sentence, at whatever length the thought needs", so the shape
+  // being judged has to be the paragraph.
+  const h = harness({
+    stream: async function* () {
+      yield { type: 'text-delta', text: '先别急着改，我看下 diff。\n如果没问题再提交。' };
+    },
+  });
+  try {
+    h.trigger(); await delay(450);
+    const draft = (await h.request('get?sessionId=s1')).body.suggestion;
+    assert.ok(draft !== null, 'the reply is usable');
+    assert.ok(draft.text.includes('我看下 diff'), 'the first sentence survives');
+    assert.ok(draft.text.includes('再提交'), 'and so does the second');
+    assert.ok(!draft.text.includes('\n'), 'wrapping is collapsed so Tab inserts one line');
+  } finally { h.dispose(); }
+});
+
+test('a draft that speaks as the assistant is still rejected', async () => {
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'Sure, I can help with that.' }; } });
+  try {
+    h.trigger(); await delay(450);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion, null);
+  } finally { h.dispose(); }
+});
+
 test('a manual clear recalls the line while a send clears it', async () => {
   // Both transitions empty the composer, so the Client cannot tell them apart and
   // reports nothing but "the composer is empty". The Host decides from the

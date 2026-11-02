@@ -4,6 +4,14 @@
   "scripts": { "test": "node --test" },
   "description": "Codex-style composer predictions for DeepSeek Harness: after each turn the session's own model drafts your next message as ghost text you accept with Tab.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NineStars-H/dsh-predict-adaptive.git"
+  },
+  "homepage": "https://github.com/NineStars-H/dsh-predict-adaptive#readme",
+  "bugs": {
+    "url": "https://github.com/NineStars-H/dsh-predict-adaptive/issues"
+  },
   "type": "module",
   "keywords": [
     "dsh",
@@ -42,6 +50,7 @@
     }
   }
 }
+
 
 
 

@@ -75,18 +75,19 @@ const PLUGIN_VERSION = (() => {
 const INSTRUCTION = [
   "Complete the message the user is about to type.",
   "",
-  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and their cursor is in the message box; write the line they are typing next, and stop.",
+  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and their cursor is in the message box; write the line they are typing next.",
   "",
-  "It is their own words: the thing they want done, in their register — the words they wrap around a command, or the part they typed before pasting the error.",
+  "It is their own words: the thing they want done, in their register — the words they wrap around a command, the correction they fire back, or the part they typed before pasting the error.",
   "",
   "What reads as a prediction:",
-  "- One sentence, often shorter. Their follow-ups are usually terse.",
-  "- Concrete: a file, a command, a check, a decision — something from this conversation.",
+  "- Their own sentence, at whatever length the thought needs. A terse follow-up when that is what the moment calls for; two or three sentences when they are explaining a problem, describing what they saw, or pushing back on the reply.",
+  "- Concrete: a file, a command, a check, a decision, or a specific correction to something the assistant just got wrong.",
   "- Same language they have been writing in.",
-  "- They may be impatient, pleased, or cutting the assistant off. Tone is part of the line.",
+  "- They may be impatient, pleased, confused, or cutting the assistant off. Tone is part of the line.",
   "",
   "Output their line and nothing else: no framing, no quotation marks, no list, no markdown.",
-  "When the conversation has no open thread — small talk, a closing thanks, nothing left to do — answer NO_PREDICTION.",
+  "",
+  "Answer NO_PREDICTION only when the user genuinely has nothing left to say here — they are closing the conversation, or the last exchange ended with nothing outstanding. A thank-you, a short acknowledgement or a casual remark is not that: the user is usually still going.",
   "",
   "=== TRANSCRIPT ===",
 ].join("\n");
@@ -119,6 +120,14 @@ function resolveConfig(raw) {
  * invites the model to reuse it as a template.
  */
 const STEERING_EXAMPLE = 80;
+/**
+ * Longest draft accepted, in characters.
+ *
+ * Generous on purpose: a user can legitimately write a paragraph, and the old
+ * 400-character line cap combined with taking only the first line was what made
+ * every suggestion read as a clipped fragment. This only rejects an essay.
+ */
+const MAX_DRAFT_CHARS = 1200;
 /** How many accepted drafts steer the next prediction. */
 const MAX_ACCEPTED = 5;
 /** How many dismissed drafts are shown as counter-examples. */
@@ -315,52 +324,64 @@ function cleanPrediction(raw) {
   const text = (raw ?? "").trim();
   if (text.length === 0) return "";
 
-  // The reply can carry more than one line even when asked for one: a fence, a
-  // short preamble, or a bulleted list. Scan candidates in order and take the
-  // first that reads as a user message, instead of judging only line one.
-  const candidates = [];
-  for (const rawLine of text.split("\n")) {
-    let line = rawLine.trim();
-    if (line.length === 0) continue;
-    line = line.replace(/^[-*•]\s*/, "").trim();
-    line = line.replace(/^#+\s*/, "").trim();
-    line = line.replace(/^["'`“”「」]+|["'`“”「」]+$/g, "").trim();
-    if (line.length === 0) continue;
-    candidates.push(line);
-  }
+  /*
+   * Judge the reply as a whole, not line by line.
+   *
+   * This used to split on newlines and return the first line that passed the
+   * filters. That silently truncated every multi-sentence suggestion — the model
+   * answers with a short paragraph, and only its opening clause survived. "Their
+   * own sentence, at whatever length the thought needs" is the instruction, so the
+   * shape that has to be judged is the paragraph.
+   *
+   * Wrapping is removed, not preserved: the composer shows two lines and a hard
+   * newline in the middle of a sentence would be inserted verbatim by Tab.
+   */
+  let reply = text;
+  // Strip a markdown fence if the whole reply is wrapped in one.
+  const fenced = /^```[^\n]*\n([\s\S]*?)\n```$/.exec(reply);
+  if (fenced !== null) reply = fenced[1];
+  // Drop a leading bullet or heading marker, and surrounding quotes.
+  reply = reply.replace(/^\s*(?:[-*•]|#+)\s+/, "").trim();
+  reply = reply.replace(/^["'`“”「」]+/, "").replace(/["'`“”「」]+$/, "").trim();
+  if (reply.length === 0) return "";
 
-  for (const line of candidates) {
-    if (/^NO_PREDICTION[.。]?$/i.test(line)) continue;
-    if (line.length > 400) continue;
-    // A draft that talks about the prediction machinery, or about being an
-    // assistant, is the model narrating its own task rather than speaking as
-    // the user. Reject that shape and keep looking.
-    if (/^(sure[,.]|here('s| is)|the user|as an ai|i (cannot|can't|don't|must|should|will|need))/i.test(line)) continue;
-    if (/\b(this|that|my|the) (message|instruction|prediction|request|prompt|constant)\b/i.test(line)) continue;
-    if (/\bINSTRUCTION\b/.test(line)) continue;
-    if (/\b(composer prediction|prediction task|you are predicting)\b/i.test(line)) continue;
-    // A markdown fence or heading is not a user message.
-    if (/^```/.test(line)) continue;
-    /*
-     * Reject a numbered or explicitly enumerated list.
-     *
-     * The reported failure read "刷新先看这两点，两行不压工具栏、预测不再编就算过；
-     * 要是还编，把 adaptive 学习关掉再出一版给我对比" — a perfectly good
-     * ASSISTANT sentence, and not something a user types. It appears when the
-     * model writes the next step of a plan instead of the next thing the user
-     * says.
-     *
-     * Only the unambiguous shape is rejected. A separator-density rule was tried
-     * and dropped: measured against this user's real accepted drafts it separated
-     * them from the bad example by under one separator per character, so it would
-     * have thrown away good predictions to catch a bad one. The prompt handles the
-     * rest, and a wrong draft costs the user one Escape.
-     */
-    const enumerated = /(^|[，,、])\s*[一二三四1234][是.、，]|首先.*其次|一是.*二是/.test(line);
-    if (enumerated) continue;
-    return line;
-  }
-  return "";
+  if (/^NO_PREDICTION[.。]?$/i.test(reply)) return "";
+  // Generous: a user can legitimately write a paragraph. The cap only exists to
+  // reject a model that ignored the instruction and wrote an essay.
+  if (reply.length > MAX_DRAFT_CHARS) return "";
+
+  // A draft that talks about the prediction machinery, or about being an
+  // assistant, is the model narrating its own task rather than speaking as the
+  // user. The word boundary goes after the whole group: `sure[,.]` ends in a
+  // non-word character, so a boundary inside the alternation never matched
+  // "Sure, I can help".
+  if (/^(?:sure|here'?s?|here is|the user|as an ai|i (?:cannot|can't|don't|must|should|will|need))\b/i.test(reply)) return "";
+  if (/\b(this|that|my|the) (message|instruction|prediction|request|prompt|constant)\b/i.test(reply)) return "";
+  if (/\bINSTRUCTION\b/.test(reply)) return "";
+  if (/\b(composer prediction|prediction task|you are predicting)\b/i.test(reply)) return "";
+  if (/^```/.test(reply)) return "";
+
+  /*
+   * Reject a to-do list handed to the user.
+   *
+   * The reported failure read "刷新先看这两点，两行不压工具栏、预测不再编就算过；
+   * 要是还编，把 adaptive 学习关掉再出一版给我对比" — a perfectly good
+   * ASSISTANT sentence, and not something a user types. It appears when the
+   * model writes the next step of a plan instead of the next thing the user
+   * says.
+   *
+   * Only the unambiguous shape is rejected. A separator-density rule was tried
+   * and dropped: measured against this user's real accepted drafts it separated
+   * them from the bad example by under one separator per character, so it would
+   * have thrown away good predictions to catch a bad one. The prompt handles the
+   * rest, and a wrong draft costs the user one Escape.
+   */
+  const enumerated = /(^|[，,、])\s*[一二三四1234][是.、，]|首先.*其次|一是.*二是/.test(reply);
+  if (enumerated) return "";
+
+  // Collapse the wrapping the model used for readability: the composer renders
+  // two lines and will re-wrap on its own.
+  return reply.replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
 }
 
 /**
@@ -1100,11 +1121,6 @@ export function apply(ctx, rawConfig) {
     }
   }
 
-  /** Forget pending work without making the dropped line recallable. */
-  function discardPending(sessionId) {
-    consumePending(sessionId);
-  }
-
   /**
    * A short tail of the conversation a suggestion was generated from.
    *
@@ -1798,6 +1814,7 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
 
 
 
