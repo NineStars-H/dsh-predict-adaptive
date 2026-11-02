@@ -162,16 +162,22 @@ window.__ModuleLoader__.load({
       const [entry, setEntry] = React.useState(null);
       const [ring, setRing] = React.useState([]);
 
-      // Texts the user rejected. A stale or duplicated reply can never bring one
-      // of these back, which is what makes Escape final without a time window.
-      const dismissedRef = React.useRef(new Set());
-      // Instant of the last send; suggestions stamped at or before it are stale.
-      const consumedAtRef = React.useRef(0);
+      // The Host's own rejection list and last-submission instant. These are the
+      // durable copies: the page unmounts this component whenever it switches
+      // conversation, so anything remembered only here would be forgotten and
+      // the rejected line would come back on the next visit.
+      const [rejected, setRejected] = React.useState(() => new Set());
+      const [consumedAt, setConsumedAt] = React.useState(0);
+
+      // The same two facts learnt locally in the moment, so the very next frame
+      // is correct without waiting for a round trip. The Host's copies take over
+      // as soon as they arrive, and a remount starts from them.
+      const [localDismissed, setLocalDismissed] = React.useState(() => new Set());
+      const [consumedLocallyAt, setConsumedLocallyAt] = React.useState(0);
+
       // Bumped on every local invalidation so an in-flight reply discards itself
       // instead of painting over the decision the user just made.
       const epochRef = React.useRef(0);
-      // Forces a repaint after mutating a ref.
-      const [, bump] = React.useReducer((n) => n + 1, 0);
 
       const refreshRef = React.useRef(null);
       const refresh = React.useCallback(() => {
@@ -192,11 +198,16 @@ window.__ModuleLoader__.load({
             );
             if (response.ok) {
               const body = await response.json();
-              // A decision made while this request was in flight wins: the reply
-              // describes a state the user has already left.
+              // A local decision made while this request was in flight wins: the
+              // reply describes a state the user has already left.
               if (!cancelled && epoch === epochRef.current) {
                 setEntry(body.suggestion ?? null);
                 setRing(Array.isArray(body.history) ? body.history : []);
+                // The rejection list and the last-submission instant come from
+                // the Host too. Keeping them there is what makes them survive a
+                // page switching conversation, which unmounts this component.
+                setRejected(new Set(Array.isArray(body.dismissed) ? body.dismissed : []));
+                setConsumedAt(typeof body.consumedAt === 'number' ? body.consumedAt : 0);
               }
             }
           } catch {
@@ -218,12 +229,15 @@ window.__ModuleLoader__.load({
       }, [sessionId]);
 
       // What to show. Every guard is a lookup or a comparison, so this resolves
-      // synchronously and nothing here can delay a repaint.
+      // synchronously and nothing here can delay a repaint. The rejection set and
+      // the submission instant are mirrored from the Host, so a remount cannot
+      // forget them.
       const candidate = React.useMemo(() => {
         const usable = (text, at) => {
           if (typeof text !== 'string' || text.length === 0) return null;
-          if (dismissedRef.current.has(text)) return null;
-          if (at !== undefined && at !== null && at <= consumedAtRef.current) return null;
+          if (rejected.has(text)) return null;
+          if (localDismissed.has(text)) return null;
+          if (at !== undefined && at !== null && at <= Math.max(consumedAt, consumedLocallyAt)) return null;
           return text;
         };
         const fresh = entry === null ? null : usable(entry.text, entry.at);
@@ -233,7 +247,7 @@ window.__ModuleLoader__.load({
           if (recalled !== null) return recalled;
         }
         return null;
-      }, [entry, ring]);
+      }, [entry, ring, rejected, consumedAt, localDismissed, consumedLocallyAt]);
 
       const show =
         candidate !== null &&
@@ -280,24 +294,26 @@ window.__ModuleLoader__.load({
         }
         if (!inserted) return;
         // The text lives in the composer now, so this half must never paint it
-        // again; otherwise clearing the field would bring it straight back.
-        dismissedRef.current.add(candidate);
+        // again; otherwise clearing the field would bring it straight back. The
+        // local set makes that true for the next frame, and `report` tells the
+        // Host so the decision survives a remount.
+        setLocalDismissed((current) => new Set(current).add(candidate));
         epochRef.current += 1;
         setEntry(null);
         setRing((current) => current.filter((item) => item !== candidate));
-        bump();
         report('accepted');
-      }, [show, candidate, inputActions, report]);
+        refresh();
+      }, [show, candidate, inputActions, report, refresh]);
 
       const dismiss = React.useCallback(() => {
         if (!show || candidate === null) return;
-        // Synchronous and final: remembered as rejected, so no reply arriving
-        // later can restore it. Nothing is awaited before the repaint.
-        dismissedRef.current.add(candidate);
+        // Synchronous and final. The local set covers the next frame, and the
+        // Host records it durably so a page switching conversation cannot forget
+        // it — that remount is exactly what used to bring a rejected line back.
+        setLocalDismissed((current) => new Set(current).add(candidate));
         epochRef.current += 1;
         setEntry(null);
         setRing((current) => current.filter((item) => item !== candidate));
-        bump();
         if (!sessionId) return;
         fetch(`${ROUTE}/dismiss`, {
           method: 'POST',
@@ -317,11 +333,10 @@ window.__ModuleLoader__.load({
         const before = previousDraft.current;
         previousDraft.current = draft;
         if (before.length === 0 || draft.length > 0) return;
-        consumedAtRef.current = Date.now();
+        setConsumedLocallyAt(Date.now());
         epochRef.current += 1;
         setEntry(null);
         setRing([]);
-        bump();
         if (!sessionId) return;
         fetch(`${ROUTE}/drop`, {
           method: 'POST',

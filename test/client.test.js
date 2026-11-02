@@ -41,7 +41,17 @@ function extractFunction(name) {
  * @param {object} options - Host reply, composer state and starting time.
  * @returns handles for driving the component.
  */
-async function mount({ draft = '', phase = 'plain', sessionId = 's1', suggestion = null, ring = [], now = 1_000 } = {}) {
+async function mount({
+  draft = '',
+  phase = 'plain',
+  sessionId = 's1',
+  suggestion = null,
+  ring = [],
+  dismissed = [],
+  consumedAt = 0,
+  hostState = null,
+  now = 1_000,
+} = {}) {
   const stateSlots = [];
   const refSlots = [];
   const callbackSlots = [];
@@ -55,7 +65,13 @@ async function mount({ draft = '', phase = 'plain', sessionId = 's1', suggestion
   let tree = null;
   let clock = now;
   let keydown = null;
-  let hostReply = { suggestion, history: ring };
+  let hostReply = {
+    suggestion,
+    history: ring,
+    dismissed,
+    consumedAt,
+  };
+  void hostState;
   /** Timers the component scheduled; the poll loop is driven by these. */
   const timers = [];
 
@@ -75,7 +91,8 @@ async function mount({ draft = '', phase = 'plain', sessionId = 's1', suggestion
     useState: (value) => {
       const index = stateCursor;
       stateCursor += 1;
-      if (!(index in stateSlots)) stateSlots[index] = value;
+      // React treats a function argument as a lazy initialiser.
+      if (!(index in stateSlots)) stateSlots[index] = typeof value === 'function' ? value() : value;
       const set = (next) => {
         const resolved = typeof next === 'function' ? next(stateSlots[index]) : next;
         if (Object.is(resolved, stateSlots[index])) return;
@@ -337,6 +354,48 @@ test('a rejected line never comes back, however often the Host repeats it', asyn
     // line. Only a time window used to hide that; now the rejection is recorded.
     app.setHostReply({ suggestion: { text: 'commit it', at: 2_000 }, history: ['commit it'] });
     await app.settle();
+    assert.equal(app.shownText(), null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a rejected line stays rejected after the page remounts', async () => {
+  // Switching conversation unmounts this component and mounts a fresh one. The
+  // rejection must therefore live on the Host: when it did not, a dismissed line
+  // came back on the next visit, which read as "Escape only works until I switch".
+  const host = { suggestion: { text: 'commit it', at: 2_000 }, history: [], dismissed: [], consumedAt: 0 };
+  const first = await mount({ ...host, hostState: host });
+  try {
+    first.press('Escape');
+    await first.flushMicrotasks();
+    assert.equal(first.shownText(), null);
+  } finally {
+    await first.dispose();
+  }
+
+  // The Host recorded the rejection; the remounted component learns it from the
+  // regular reply and refuses to paint the same line again.
+  const second = await mount({
+    suggestion: { text: 'commit it', at: 2_000 },
+    history: ['commit it'],
+    dismissed: ['commit it'],
+  });
+  try {
+    assert.equal(second.shownText(), null, 'the rejected line does not return');
+  } finally {
+    await second.dispose();
+  }
+});
+
+test('a line produced before the last send is not painted after a remount', async () => {
+  // The send instant is durable for the same reason: without it, reopening the
+  // conversation showed a suggestion that belonged to the composer already left.
+  const app = await mount({
+    suggestion: { text: 'stale line', at: 1_500 },
+    consumedAt: 5_000,
+  });
+  try {
     assert.equal(app.shownText(), null);
   } finally {
     await app.dispose();

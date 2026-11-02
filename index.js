@@ -736,6 +736,25 @@ export function apply(ctx, rawConfig) {
   // that same completed turn has already started or finished.
   const predictionUserSeq = new Map();
   const predictionTurnKey = new Map();
+  /**
+   * Texts this session has rejected, and when it last submitted.
+   *
+   * Both live here rather than in the Client because the Client unmounts when the
+   * page switches conversation: a rejection stored there would be forgotten and
+   * the line would come back on the next visit, and a submission instant stored
+   * there would be lost the same way. Keeping them on the Host makes
+   * "this line is rejected" a property of the session, not of one mounted view.
+   */
+  const rejected = new Map();
+  const consumedAt = new Map();
+
+  /** Remember a rejected text for this session, bounded so it cannot grow. */
+  function reject(sessionId, text) {
+    if (typeof text !== 'string' || text.length === 0) return;
+    const list = rejected.get(sessionId) ?? [];
+    if (list.includes(text)) return;
+    rejected.set(sessionId, [...list, text].slice(-MAX_HISTORY * 4));
+  }
 
   /**
    * The newest submission sequence, and which turn the log tail describes.
@@ -1065,6 +1084,14 @@ export function apply(ctx, rawConfig) {
             // Newest first. The Client uses this to offer a recall affordance
             // after the composer has been cleared.
             history: (history.get(sessionId) ?? []).slice(0, MAX_HISTORY),
+            // Texts this session rejected. The Client cannot keep this itself: it
+            // unmounts whenever the page switches conversation, so a rejection
+            // stored there would be forgotten and the line would return on the
+            // next visit. This is the durable answer to "is this line rejected".
+            dismissed: [...(rejected.get(sessionId) ?? [])],
+            // Instant of the last submission. Anything produced at or before it
+            // belongs to the composer the user already left.
+            consumedAt: consumedAt.get(sessionId) ?? 0,
             // Why the last attempt produced nothing, when it did. A session asks
             // for its own reason; the settings page has no session and gets the
             // most recent one instead.
@@ -1149,6 +1176,9 @@ export function apply(ctx, rawConfig) {
           const body = await readJson(req);
           if (typeof body.sessionId === "string") {
             const entry = drafts.get(body.sessionId);
+            // Record the rejection durably, whether or not the draft is still in
+            // the map: the Client reports the exact text it was showing.
+            reject(body.sessionId, typeof body.text === "string" ? body.text : entry?.text);
             // A dismissal is a negative example only when a draft was actually
             // shown; closing the ghost before anything appeared teaches nothing.
             if (entry !== undefined && entry.text.length > 0 && live.adaptive) {
@@ -1170,10 +1200,15 @@ export function apply(ctx, rawConfig) {
           // The pending draft is now stale: remove it without recording feedback
           // and without making it recallable, because it was never acted on.
           // Any prediction still in flight belongs to the previous composer and
-          // is invalidated too.
+          // is invalidated too. The instant is recorded so anything the Host had
+          // already produced is recognisably older than this send, even after the
+          // page is reopened.
           if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
           const body = await readJson(req);
-          if (typeof body.sessionId === "string") consumePending(body.sessionId);
+          if (typeof body.sessionId === "string") {
+            consumedAt.set(body.sessionId, Date.now());
+            consumePending(body.sessionId);
+          }
           return send(200, { ok: true });
         }
         if (action === "accepted") {
@@ -1219,6 +1254,8 @@ export function apply(ctx, rawConfig) {
     dropEpoch.clear();
     predictionUserSeq.clear();
     predictionTurnKey.clear();
+    rejected.clear();
+    consumedAt.clear();
     triggerStates.clear();
     disposeTriggers();
     offCreated();
