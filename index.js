@@ -107,10 +107,20 @@ function resolveConfig(raw) {
   const recentTurns = Number.isInteger(source.recentTurns)
     ? Math.min(Math.max(source.recentTurns, 1), 40)
     : 6;
-  // `adaptive` turns the learned steering on or off. With it off this build
-  // behaves exactly like the plain build: same directive, same context, no
-  // per-session examples. That makes a separate basic bundle unnecessary.
-  const adaptive = source.adaptive !== false;
+  /*
+   * `adaptive` is OFF by default, and deliberately so.
+   *
+   * It appends the last couple of accepted and dismissed drafts to the prompt as a
+   * style reference. Nothing has shown that this produces better predictions — no
+   * controlled comparison has ever been run — and the mechanism has a known failure
+   * mode: in a conversation whose follow-ups resemble each other, the examples read
+   * as a template and the model returns the same sentence with different nouns.
+   *
+   * An unproven feature should not be on by default. The switch stays so the
+   * comparison can be made once there is enough real data: the same conversation
+   * with steering on and off, and a reason to believe it helps.
+   */
+  const adaptive = source.adaptive === true;
   // Both default on: they make a draft more actionable, and each can be turned
   // off from the plugin page when the extra prompt or the delay is unwanted.
   const workspace = source.workspace !== false;
@@ -1811,7 +1821,7 @@ export const inject = ["llm", "webServer", "agents"];
  */
 export const DEFAULT_CONFIG = {
   enabled: true,
-  adaptive: true,
+  adaptive: false,
   workspace: true,
   diagnostics: false,
   mode: "full",
@@ -1819,6 +1829,7 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
 
 
 

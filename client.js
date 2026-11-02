@@ -345,6 +345,16 @@ window.__ModuleLoader__.load({
       // in state is what stops the ghost blinking back between the send and the
       // next Host reply: a ref would change the flag without a repaint.
       const [sent, setSent] = React.useState(false);
+      /*
+       * When the last send happened, as the Host stamped it.
+       *
+       * The latch above has to be released when the Host reports a suggestion from
+       * a LATER turn, and the only trustworthy way to tell "later" is to compare
+       * timestamps: a reply that still describes the submitted turn must not
+       * release it, or the ghost would blink back over the freshly emptied
+       * composer.
+       */
+      const sentAtRef = React.useRef(0);
 
       const refreshRef = React.useRef(null);
       const refresh = React.useCallback(() => {
@@ -368,13 +378,29 @@ window.__ModuleLoader__.load({
               // A local decision made while this request was in flight wins: the
               // reply describes a state the user has already left.
               if (!cancelled && epoch === epochRef.current) {
-                setEntry(body.suggestion ?? null);
+                const next = body.suggestion ?? null;
+                setEntry(next);
                 setRing(Array.isArray(body.history) ? body.history : []);
                 // The rejection list and the last-submission instant come from
                 // the Host too. Keeping them there is what makes them survive a
                 // page switching conversation, which unmounts this component.
                 setRejected(new Set(Array.isArray(body.dismissed) ? body.dismissed : []));
                 setConsumedAt(typeof body.consumedAt === 'number' ? body.consumedAt : 0);
+                /*
+                 * A suggestion the Host produced AFTER the last send belongs to a
+                 * new turn, so the send latch no longer applies.
+                 *
+                 * This is what the latch was missing. It was set when a submission
+                 * started and cleared only by typing, so after a normal turn the
+                 * ghost stayed suppressed until something remounted the component —
+                 * switching conversation and back. That is exactly the reported
+                 * "no suggestion until I switch and return".
+                 *
+                 * `at` is the Host's own timestamp, so a reply describing the turn
+                 * that was just submitted cannot clear the latch; only a genuinely
+                 * newer one can.
+                 */
+                if (next !== null && next.at > sentAtRef.current) setSent(false);
               }
             }
           } catch {
@@ -514,10 +540,11 @@ window.__ModuleLoader__.load({
       // the next poll. Watching only the echo made the ghost blink — hidden while
       // it was live, repainted when it retired, then gone again on the poll.
       //
-      // The latch is cleared only by evidence of a NEW composer: a Host reply that
-      // reports a fresh suggestion, or the user typing again.
+      // The latch is cleared by evidence of a NEW composer: a Host reply reporting a
+      // suggestion stamped after the send, or the user typing again.
       React.useEffect(() => {
         if (pending === 0) return;
+        sentAtRef.current = Date.now();
         setSent(true);
         setEntry(null);
         setRing([]);
@@ -757,7 +784,7 @@ window.__ModuleLoader__.load({
         'div',
         { style: styles.section },
         row(t.toggleLabel, t.toggleHint, checkbox(draft.enabled !== false, (next) => patch({ enabled: next }))),
-        row(t.adaptiveLabel, t.adaptiveHint, checkbox(draft.adaptive !== false, (next) => patch({ adaptive: next }))),
+        row(t.adaptiveLabel, t.adaptiveHint, checkbox(draft.adaptive === true, (next) => patch({ adaptive: next }))),
         row(t.workspaceLabel, t.workspaceHint, checkbox(draft.workspace !== false, (next) => patch({ workspace: next }))),
         row(
           t.contextLabel,
@@ -1102,6 +1129,7 @@ window.__ModuleLoader__.load({
     };
   },
 });
+
 
 
 

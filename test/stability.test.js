@@ -530,7 +530,13 @@ test('settings and learned feedback survive disposal and reload', async () => {
   let h;
   try {
     h = harness({ stateDir: dir });
-    assert.equal((await h.request('config', { method: 'POST', body: { mode: 'recent', recentTurns: 3 } })).status, 200);
+    // Learning is off by default, so this test turns it on explicitly — it is
+    // asserting that learned feedback is written and read back, which only
+    // happens when the feature is enabled.
+    assert.equal(
+      (await h.request('config', { method: 'POST', body: { mode: 'recent', recentTurns: 3, adaptive: true } })).status,
+      200,
+    );
     h.trigger(); await delay(450);
     assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
     await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });

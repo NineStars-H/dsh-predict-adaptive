@@ -423,9 +423,14 @@ test('the ghost does not blink back after the submission echo retires', async ()
   // retires. If the visibility rule only watched the echo, that retirement would
   // paint the old draft again until the next poll dropped it — a visible blink.
   // The send therefore also has to record that this composer is finished with.
+  //
+  // The draft is stamped BEFORE the send (`at` < now) on purpose: that is what a
+  // stale reply looks like. A suggestion stamped after the send belongs to the
+  // next turn and is expected to appear.
   const app = await mount({
-    suggestion: { text: 'run the tests', at: 2_000 },
+    suggestion: { text: 'run the tests', at: 500 },
     pending: [{ requestId: 'r1', placement: 'transcript', text: 'run the tests' }],
+    now: 1_000,
   });
   try {
     assert.equal(app.tree, null, 'hidden while the echo is live');
@@ -519,6 +524,52 @@ test('a long suggestion is clamped to two lines instead of overflowing', async (
 
     // The text is still complete in the DOM, so Tab can insert all of it.
     assert.equal(app.shownText(), long);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a suggestion from a later turn is shown after a send', async () => {
+  // The reported failure: the turn finished, but no ghost appeared until the user
+  // switched conversation and came back. The send latch was released only by
+  // typing, so after a normal turn it stayed set until the component remounted —
+  // which switching conversation does.
+  const app = await mount({ now: 1_000 });
+  try {
+    // The user submits: the echo appears, the ghost is suppressed.
+    app.setPending([{ requestId: 'r1', placement: 'transcript', text: 'go' }]);
+    await app.settle();
+    assert.equal(app.shownText(), null, 'suppressed while the send is in flight');
+
+    // The echo retires. Still nothing: the Host has not answered yet.
+    app.setPending([]);
+    await app.settle();
+    assert.equal(app.shownText(), null, 'still suppressed right after the send');
+
+    // The Host finishes the next turn and reports a suggestion stamped later.
+    app.advanceClock(5_000);
+    app.setHostReply({ suggestion: { text: '再跑一遍测试', at: 6_000 }, history: [], dismissed: [], consumedAt: 0 });
+    await app.pollOnce();
+    assert.equal(app.shownText(), '再跑一遍测试', 'the new turn is shown without switching conversation');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a reply describing the submitted turn does not un-suppress the ghost', async () => {
+  // The mirror case: a stale reply stamped at or before the send must not paint
+  // over the freshly emptied composer.
+  const app = await mount({ suggestion: { text: 'old line', at: 500 }, now: 1_000 });
+  try {
+    app.setPending([{ requestId: 'r1', placement: 'transcript', text: 'go' }]);
+    await app.settle();
+    assert.equal(app.shownText(), null);
+
+    // The Host has not caught up: it still reports the pre-send suggestion.
+    app.setPending([]);
+    app.setHostReply({ suggestion: { text: 'old line', at: 500 }, history: [], dismissed: [], consumedAt: 0 });
+    await app.pollOnce();
+    assert.equal(app.shownText(), null, 'an older stamp stays suppressed');
   } finally {
     await app.dispose();
   }
