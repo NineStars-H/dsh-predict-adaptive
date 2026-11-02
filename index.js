@@ -76,7 +76,13 @@ const INSTRUCTION = [
   "- If the transcript left a specific unresolved item (a failing check, an unverified claim, an unfinished step), name it together with the exact file or command.",
   "- One line. One sentence is ideal; a second sentence is allowed only when naming files is what makes it useful.",
   "- No preamble, no quotes, no bullets, no explanation, no markdown fence.",
-  "- If there is no plausible next message, output exactly: NO_PREDICTION",
+  "",
+  "Grounding rules — a draft that breaks these is worse than no draft:",
+  "- Only refer to things that actually appear in the transcript: files, commands, errors, decisions. Never invent a file name, a path, a test name, a number, or a claim the transcript does not contain.",
+  "- Do not describe what the ASSISTANT did, and do not restate or summarise the conversation back to the user.",
+  "- Do not propose a plan the user never hinted at. Continue THEIR direction, not a plausible-sounding one of your own.",
+  "- If the transcript is small talk, a bare acknowledgement, or has no open thread, output exactly: NO_PREDICTION",
+  "- Before answering, check each concrete detail in your draft against the transcript. Drop anything you cannot point to.",
   "",
   "=== TRANSCRIPT ===",
 ].join("\n");
@@ -102,8 +108,13 @@ function resolveConfig(raw) {
   return { enabled: source.enabled !== false, mode, recentTurns, adaptive, workspace, permissions, diagnostics };
 }
 
-/** Longest example kept as a steering hint; longer drafts are truncated. */
-const MAX_EXAMPLE = 240;
+/**
+ * How much of an accepted draft is quoted back as a style hint.
+ *
+ * Short on purpose: a full sentence is enough to carry register, and a long one
+ * invites the model to reuse it as a template.
+ */
+const STEERING_EXAMPLE = 80;
 /** How many accepted drafts steer the next prediction. */
 const MAX_ACCEPTED = 5;
 /** How many dismissed drafts are shown as counter-examples. */
@@ -154,14 +165,36 @@ function resolveFeedback(raw) {
  */
 function steeringText(feedback) {
   if (feedback.accepted.length === 0 && feedback.dismissed.length === 0) return "";
-  const lines = ["", "This user's own recent follow-ups in THIS conversation, which you should match in voice, length, and specificity:"];
-  if (feedback.accepted.length > 0) {
-    lines.push("ACCEPTED (they pressed Tab on these, so they are on target):");
-    for (const item of feedback.accepted) lines.push(`- ${item.slice(0, MAX_EXAMPLE)}`);
+  /*
+   * Accepted drafts teach TONE, not subject matter.
+   *
+   * They used to be presented as "match these in voice, length and specificity"
+   * with up to several full examples. In a conversation where the user's
+   * follow-ups resemble each other, that reads as a template and the model keeps
+   * producing the same sentence with different nouns — the "it keeps making
+   * things up" complaint. Two short exemplars carry voice; more only narrow it.
+   *
+   * Dismissed drafts remain useful as a warning about shape, so they keep
+   * examples too, but only the most recent few.
+   */
+  const accepted = feedback.accepted.slice(-2);
+  const dismissed = feedback.dismissed.slice(-2);
+  const lines = [
+    "",
+    "Style reference only. These are things this user said in THIS conversation: copy the register, not the wording, and do not reuse their subject unless the transcript is still about it.",
+  ];
+  if (accepted.length > 0) {
+    lines.push("ACCEPTED (on target):");
+    for (const item of accepted) {
+      // One line each: a long exemplar becomes a template to reuse.
+      lines.push(`- ${item.slice(0, STEERING_EXAMPLE).replace(/\s+/g, " ").trim()}`);
+    }
   }
-  if (feedback.dismissed.length > 0) {
-    lines.push("DISMISSED (they ignored these, so avoid this shape or subject):");
-    for (const item of feedback.dismissed) lines.push(`- ${item.slice(0, MAX_EXAMPLE)}`);
+  if (dismissed.length > 0) {
+    lines.push("DISMISSED (avoid this shape):");
+    for (const item of dismissed) {
+      lines.push(`- ${item.slice(0, STEERING_EXAMPLE).replace(/\s+/g, " ").trim()}`);
+    }
   }
   return lines.join("\n");
 }
@@ -1452,5 +1485,7 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
+
 
 

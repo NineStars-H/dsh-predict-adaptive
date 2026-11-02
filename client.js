@@ -138,7 +138,6 @@ window.__ModuleLoader__.load({
         right: '8px',
         font: 'inherit',
         fontSize: 'inherit',
-        lineHeight: 'inherit',
         fontWeight: 'inherit',
         fontStyle: 'normal',
         color: 'var(--dsw-alias-label-caption)',
@@ -147,6 +146,24 @@ window.__ModuleLoader__.load({
         whiteSpace: 'pre-wrap',
         overflowWrap: 'anywhere',
         wordBreak: 'break-word',
+        /*
+         * Two lines must end above the toolbar.
+         *
+         * The budget, measured from the card's top edge:
+         *
+         *   8px card padding-top + 4px placeholder inset   = 12px  (this `top`)
+         *   36px editor min-height -> editor ends at         44px
+         *   12px card gap -> the toolbar starts at           56px
+         *
+         * So there are 44px for the text. Inheriting the composer's line box gives
+         * 24px per line, and two of those reach 60px — 4px over, which is exactly
+         * the half-covered second line that showed up. Tightening the line box to
+         * 22px puts two lines at 44px, flush against the toolbar and not past it.
+         * 22px still clears the 14px font, so the text is not cramped.
+         */
+        lineHeight: '22px',
+        // Room for the descenders of the second line inside that budget.
+        paddingBottom: '0px',
         // The container is a row: the text, then the Tab badge beside it. The line
         // clamp below lives on the text itself, so this stays a flex row.
         display: 'flex',
