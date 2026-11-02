@@ -131,9 +131,10 @@ window.__ModuleLoader__.load({
       // recent, the Client paints nothing and lets the Host catch up.
       const clearedAtRef = React.useRef(0);
       // The poll below is mounted once per session, so it must not close over
-      // `draft`; this ref carries the current value into that closure.
+      // `draft`; this ref carries the current value into that closure. It is
+      // assigned after `draft` is read below — reading `draft` here would be a
+      // temporal-dead-zone error and would take the whole overlay down.
       const draftRef = React.useRef('');
-      draftRef.current = draft;
 
       React.useEffect(() => {
         if (!sessionId) return undefined;
@@ -184,6 +185,9 @@ window.__ModuleLoader__.load({
       const draft = typeof input?.draft === 'string' ? input.draft : '';
       const phase = input?.phase;
       const attachmentCount = Array.isArray(input?.attachmentIds) ? input.attachmentIds.length : 0;
+      // Keep the poll's view of the composer current; assigned here, after the
+      // declaration above, so no temporal-dead-zone read can occur.
+      draftRef.current = draft;
 
       // A send empties the composer. The poll that follows decides what comes
       // back, so this only has to hide the locally cached copy immediately.
