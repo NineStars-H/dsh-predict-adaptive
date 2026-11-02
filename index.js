@@ -1274,18 +1274,59 @@ export function apply(ctx, rawConfig) {
           return send(200, { ok: true });
         }
         if (action === "drop") {
-          // The user sent their own message instead of taking the suggestion.
-          // The pending draft is now stale: remove it without recording feedback
-          // and without making it recallable, because it was never acted on.
-          // Any prediction still in flight belongs to the previous composer and
-          // is invalidated too. The instant is recorded so anything the Host had
-          // already produced is recognisably older than this send, even after the
-          // page is reopened.
+          // Tell the Host the composer went empty so whatever it produced for that
+          // composer is invalidated.
+          //
+          // The Client cannot distinguish a send from a manual clear: both are
+          // "the field became empty". The Host CAN, so the decision belongs here:
+          // `submitted` is true only when the session log gained a user message,
+          // which a manual clear never does.
+          //
+          //   submitted   -> the line was not taken, and the user has moved on:
+          //                  drop it and do not make it recallable.
+          //   manual clear -> the user did not act on it at all: keep it in the
+          //                  ring so the ghost comes straight back, which is the
+          //                  behaviour this whole recall ring exists for.
           if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
           const body = await readJson(req);
           if (typeof body.sessionId === "string") {
-            consumedAt.set(body.sessionId, Date.now());
-            consumePending(body.sessionId);
+            const sessionId = body.sessionId;
+            // The Client knows the transition that just happened; the session log
+            // only knows it a moment later, after the Host has appended the user
+            // message. Prefer the Client's report, and consult the log only when
+            // the Client did not say — that keeps the common case free of a race
+            // where the log has not caught up and a send looks like a clear.
+            let submitted = typeof body.submitted === "boolean" ? body.submitted : false;
+            if (typeof body.submitted !== "boolean") {
+              const agent = ctx.agents.get(sessionId);
+              if (agent !== undefined) {
+                try {
+                  const boundary = logBoundary(agent.session);
+                  submitted = boundary.lastUser > (predictionUserSeq.get(sessionId) ?? -1);
+                } catch {
+                  /* the log is unavailable; keep the default */
+                }
+              }
+            }
+            if (submitted) {
+              consumedAt.set(sessionId, Date.now());
+              rejected.set(sessionId, []);   // nothing from the old composer is wanted
+              drafts.delete(sessionId);
+              history.delete(sessionId);
+            } else {
+              // Manual clear: forget the pending draft but keep every line that
+              // was recallable, so the composer refills with the last suggestion.
+              dropEpoch.set(sessionId, (dropEpoch.get(sessionId) ?? 0) + 1);
+            }
+            const prior = inflight.get(sessionId);
+            if (prior !== undefined) {
+              try {
+                prior.abort();
+              } catch {
+                /* already settled */
+              }
+              inflight.delete(sessionId);
+            }
           }
           recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });

@@ -76,6 +76,30 @@ test('authentication is required and unavailable authentication fails closed', a
   try { assert.equal((await throws.request('get')).status, 503); } finally { throws.dispose(); }
 });
 
+test('a manual clear recalls the line while a send clears it', async () => {
+  // Both transitions empty the composer, so the Client cannot tell them apart.
+  // Treating them the same is what broke "clear the field and the suggestion
+  // comes back": every clear was reported as a send, which dropped the ring.
+  const h = harness();
+  try {
+    // Tab, then the user clears the field by hand.
+    h.trigger(); await delay(450);
+    const first = (await h.request('get?sessionId=s1')).body.suggestion;
+    await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: false } });
+    const cleared = (await h.request('get?sessionId=s1')).body;
+    assert.deepEqual(cleared.history, [first.text], 'the line stays recallable');
+    assert.equal(cleared.suggestion ?? cleared.history[0], first.text, 'so it is painted again');
+
+    // Now a real send.
+    h.trigger(); await delay(450);
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: true } });
+    const sent = (await h.request('get?sessionId=s1')).body;
+    assert.deepEqual(sent.history, [], 'a send leaves nothing to recall');
+    assert.equal(sent.suggestion, null);
+  } finally { h.dispose(); }
+});
+
 test('every mutation works when the desktop proxy has stripped Origin', async () => {
   // This is the regression that mattered.
   //
@@ -320,7 +344,9 @@ test('superseded or dropped prediction failures cannot replace current state', a
     let state = (await h.request('get?sessionId=s1')).body;
     assert.equal(state.suggestion.text, 'New suggestion'); assert.equal(state.error, null);
     h.trigger(); await delay(450);
-    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    // A send, not a manual clear: the Client reports `submitted: true` and, with
+    // no live session log to consult here, the Host takes that at its word.
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: true } });
     pending[2].reject(Error('dropped failure')); await delay(10);
     state = (await h.request('get?sessionId=s1')).body;
     assert.equal(state.suggestion, null); assert.equal(state.error, null);

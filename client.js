@@ -172,12 +172,17 @@ window.__ModuleLoader__.load({
       // The same two facts learnt locally in the moment, so the very next frame
       // is correct without waiting for a round trip. The Host's copies take over
       // as soon as they arrive, and a remount starts from them.
+      // Texts rejected by Escape in this mount. The Host keeps the durable copy;
+      // this only makes the very next frame correct.
       const [localDismissed, setLocalDismissed] = React.useState(() => new Set());
-      const [consumedLocallyAt, setConsumedLocallyAt] = React.useState(0);
 
       // Bumped on every local invalidation so an in-flight reply discards itself
       // instead of painting over the decision the user just made.
       const epochRef = React.useRef(0);
+      // The text this half just inserted with Tab, so the transition that follows
+      // can be recognised as "an accept, then the field emptied" rather than a
+      // send. It is a hint for the Host, which decides from the session log.
+      const acceptPendingRef = React.useRef(null);
 
       const refreshRef = React.useRef(null);
       const refresh = React.useCallback(() => {
@@ -237,7 +242,7 @@ window.__ModuleLoader__.load({
           if (typeof text !== 'string' || text.length === 0) return null;
           if (rejected.has(text)) return null;
           if (localDismissed.has(text)) return null;
-          if (at !== undefined && at !== null && at <= Math.max(consumedAt, consumedLocallyAt)) return null;
+          if (at !== undefined && at !== null && at <= consumedAt) return null;
           return text;
         };
         const fresh = entry === null ? null : usable(entry.text, entry.at);
@@ -247,7 +252,7 @@ window.__ModuleLoader__.load({
           if (recalled !== null) return recalled;
         }
         return null;
-      }, [entry, ring, rejected, consumedAt, localDismissed, consumedLocallyAt]);
+      }, [entry, ring, rejected, consumedAt, localDismissed]);
 
       const show =
         candidate !== null &&
@@ -293,11 +298,11 @@ window.__ModuleLoader__.load({
           /* the composer refused the insertion; leave the ghost alone */
         }
         if (!inserted) return;
-        // The text lives in the composer now, so this half must never paint it
-        // again; otherwise clearing the field would bring it straight back. The
-        // local set makes that true for the next frame, and `report` tells the
-        // Host so the decision survives a remount.
-        setLocalDismissed((current) => new Set(current).add(candidate));
+        // The text now lives in the composer, so it must not be painted under the
+        // cursor. That is not the same as rejecting it: the ring keeps the line so
+        // clearing the field brings it back. Recording what was inserted lets the
+        // next empty-composer transition be read as an accept rather than a send.
+        acceptPendingRef.current = candidate;
         epochRef.current += 1;
         setEntry(null);
         setRing((current) => current.filter((item) => item !== candidate));
@@ -325,24 +330,28 @@ window.__ModuleLoader__.load({
           .catch(() => {});
       }, [show, candidate, sessionId, refresh]);
 
-      // A send empties the composer. Nothing may be painted for that composer
-      // afterwards, so stamp the instant, drop the cached list, and tell the Host
-      // to forget the line. All of it is local, so the ghost is gone this frame.
+      // The composer went from non-empty to empty. Two very different events look
+      // identical here — a send, and the user clearing the field by hand — and
+      // treating them the same is what broke "clear the field and the suggestion
+      // returns". This half cannot tell them apart, so it reports the fact and
+      // lets the Host decide from the session log; `submitted` is only a hint for
+      // when the log is unavailable.
       const previousDraft = React.useRef(draft);
       React.useEffect(() => {
         const before = previousDraft.current;
         previousDraft.current = draft;
         if (before.length === 0 || draft.length > 0) return;
-        setConsumedLocallyAt(Date.now());
-        epochRef.current += 1;
+        const inserted = before === acceptPendingRef.current;
+        acceptPendingRef.current = null;
+        // Optimistically hide it for this frame either way; the next poll either
+        // restores it (manual clear) or keeps it gone (send).
         setEntry(null);
-        setRing([]);
         if (!sessionId) return;
         fetch(`${ROUTE}/drop`, {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: String(sessionId) }),
+          body: JSON.stringify({ sessionId: String(sessionId), submitted: !inserted }),
         })
           .then(() => refresh())
           .catch(() => {});
