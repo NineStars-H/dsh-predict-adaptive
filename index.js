@@ -25,41 +25,68 @@
  * @module dsh-prompt-predict-adaptive
  */
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Route prefix owned by this plugin; the Client half posts here. */
 const ROUTE = "/prompt-predict-adaptive";
 /** Directory name under the DSH home holding this plugin's single state file. */
 const STATE_DIR = "prompt-predict-adaptive";
+/**
+ * How often the safety-net scan runs.
+ *
+ * The turn signals arrive by event, so this scan exists only to catch a session
+ * that appeared without `agent/created` reaching the plugin and to notice a
+ * `turn/end` the event path missed. Neither is time-critical, and the scan walks
+ * the tail of every live session, so running it twice a second spends real work
+ * on a path that is almost always a no-op. Five seconds still recovers long
+ * before anyone would notice.
+ */
+const POLL_INTERVAL = 5000;
 
 /**
- * The directive. It is appended as the FINAL user message after the replayed
- * conversation, so the auxiliary call is a genuine prefix of the last routed
- * request and the provider's prefix cache stays warm.
+ * This package's own version, read from its manifest.
  *
- * Wording follows what actually produced useful drafts in practice: name the
- * concrete next action, keep the user's own language, and refuse to invent a
- * suggestion when the conversation has no obvious continuation.
+ * Reported by the `/diag` route so a running profile can be identified without
+ * guessing which tag was installed. Read once at load; the file cannot change
+ * while the process runs.
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, "package.json"), "utf8")).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
+
+/**
+ * The directive.
+ *
+ * Sent as the single user message, above the transcript. There is no reusable
+ * prefix here to keep warm: every prediction is one self-contained message built
+ * from scratch, so this text costs one prompt per call and nothing is cached
+ * across calls. That is also why it is kept short.
+ *
+ * Phrased as a description of the voice rather than a list of bans. Rules that
+ * only say "never do X" leave the shape of X in the prompt, and the model tends
+ * to reproduce what it has just been told about.
  */
 const INSTRUCTION = [
-  "You are a transcript analyst. Below this instruction message is a transcript of a finished conversation between a USER and a coding ASSISTANT.",
+  "Complete the message the user is about to type.",
   "",
-  "Your ONLY job: predict the single next message the USER would most likely type.",
+  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and their cursor is in the message box; write the line they are typing next, and stop.",
   "",
-  "Hard constraints:",
-  "- Output plain text only. Do NOT emit tool calls, function calls, XML/DSML tags, JSON, or any protocol markup.",
-  "- Do NOT continue the conversation, do NOT answer the user, do NOT write as the ASSISTANT.",
-  "- Do NOT comment on this instruction or on the transcript.",
-  "- There is no tool available to you. Do not attempt to use one.",
+  "It is their own words: the thing they want done, in their register — the words they wrap around a command, or the part they typed before pasting the error.",
   "",
-  "Content rules:",
-  "- Write in the same language the USER has been using.",
-  "- Phrase it as the USER speaking: imperative, first person.",
-  "- Prefer the most probable CONCRETE next step: run the tests, fix that failure, commit it, verify a specific file, continue the plan.",
-  "- If the transcript left a specific unresolved item (a failing check, an unverified claim, an unfinished step), name it together with the exact file or command.",
-  "- One line. One sentence is ideal; a second sentence is allowed only when naming files is what makes it useful.",
-  "- No preamble, no quotes, no bullets, no explanation, no markdown fence.",
-  "- If there is no plausible next message, output exactly: NO_PREDICTION",
+  "What reads as a prediction:",
+  "- One sentence, often shorter. Their follow-ups are usually terse.",
+  "- Concrete: a file, a command, a check, a decision — something from this conversation.",
+  "- Same language they have been writing in.",
+  "- They may be impatient, pleased, or cutting the assistant off. Tone is part of the line.",
+  "",
+  "Output their line and nothing else: no framing, no quotation marks, no list, no markdown.",
+  "When the conversation has no open thread — small talk, a closing thanks, nothing left to do — answer NO_PREDICTION.",
   "",
   "=== TRANSCRIPT ===",
 ].join("\n");
@@ -85,8 +112,13 @@ function resolveConfig(raw) {
   return { enabled: source.enabled !== false, mode, recentTurns, adaptive, workspace, permissions, diagnostics };
 }
 
-/** Longest example kept as a steering hint; longer drafts are truncated. */
-const MAX_EXAMPLE = 240;
+/**
+ * How much of an accepted draft is quoted back as a style hint.
+ *
+ * Short on purpose: a full sentence is enough to carry register, and a long one
+ * invites the model to reuse it as a template.
+ */
+const STEERING_EXAMPLE = 80;
 /** How many accepted drafts steer the next prediction. */
 const MAX_ACCEPTED = 5;
 /** How many dismissed drafts are shown as counter-examples. */
@@ -137,14 +169,36 @@ function resolveFeedback(raw) {
  */
 function steeringText(feedback) {
   if (feedback.accepted.length === 0 && feedback.dismissed.length === 0) return "";
-  const lines = ["", "This user's own recent follow-ups in THIS conversation, which you should match in voice, length, and specificity:"];
-  if (feedback.accepted.length > 0) {
-    lines.push("ACCEPTED (they pressed Tab on these, so they are on target):");
-    for (const item of feedback.accepted) lines.push(`- ${item.slice(0, MAX_EXAMPLE)}`);
+  /*
+   * Accepted drafts teach TONE, not subject matter.
+   *
+   * They used to be presented as "match these in voice, length and specificity"
+   * with up to several full examples. In a conversation where the user's
+   * follow-ups resemble each other, that reads as a template and the model keeps
+   * producing the same sentence with different nouns — the "it keeps making
+   * things up" complaint. Two short exemplars carry voice; more only narrow it.
+   *
+   * Dismissed drafts remain useful as a warning about shape, so they keep
+   * examples too, but only the most recent few.
+   */
+  const accepted = feedback.accepted.slice(-2);
+  const dismissed = feedback.dismissed.slice(-2);
+  const lines = [
+    "",
+    "Style reference only. These are things this user said in THIS conversation: copy the register, not the wording, and do not reuse their subject unless the transcript is still about it.",
+  ];
+  if (accepted.length > 0) {
+    lines.push("ACCEPTED (on target):");
+    for (const item of accepted) {
+      // One line each: a long exemplar becomes a template to reuse.
+      lines.push(`- ${item.slice(0, STEERING_EXAMPLE).replace(/\s+/g, " ").trim()}`);
+    }
   }
-  if (feedback.dismissed.length > 0) {
-    lines.push("DISMISSED (they ignored these, so avoid this shape or subject):");
-    for (const item of feedback.dismissed) lines.push(`- ${item.slice(0, MAX_EXAMPLE)}`);
+  if (dismissed.length > 0) {
+    lines.push("DISMISSED (avoid this shape):");
+    for (const item of dismissed) {
+      lines.push(`- ${item.slice(0, STEERING_EXAMPLE).replace(/\s+/g, " ").trim()}`);
+    }
   }
   return lines.join("\n");
 }
@@ -234,6 +288,16 @@ function buildContext(session, config) {
     lines.push(`${who}: ${item.text}`);
   }
   if (lines.length === 0) return [];
+  /*
+   * End on an open "USER:" turn.
+   *
+   * Without it the input reads as a finished document plus a task, and the model
+   * answers in an analyst's voice — lists of what to do next, or a restatement of
+   * the assistant's own last message. A dangling speaker label makes the job
+   * "finish this line" rather than "describe this", which is the whole difference
+   * between a prediction and a summary.
+   */
+  lines.push("USER:");
   const transcript = lines.join("\n\n");
   return [{ role: "user", content: [{ type: "text", text: transcript }] }];
 }
@@ -277,6 +341,23 @@ function cleanPrediction(raw) {
     if (/\b(composer prediction|prediction task|you are predicting)\b/i.test(line)) continue;
     // A markdown fence or heading is not a user message.
     if (/^```/.test(line)) continue;
+    /*
+     * Reject a numbered or explicitly enumerated list.
+     *
+     * The reported failure read "刷新先看这两点，两行不压工具栏、预测不再编就算过；
+     * 要是还编，把 adaptive 学习关掉再出一版给我对比" — a perfectly good
+     * ASSISTANT sentence, and not something a user types. It appears when the
+     * model writes the next step of a plan instead of the next thing the user
+     * says.
+     *
+     * Only the unambiguous shape is rejected. A separator-density rule was tried
+     * and dropped: measured against this user's real accepted drafts it separated
+     * them from the bad example by under one separator per character, so it would
+     * have thrown away good predictions to catch a bad one. The prompt handles the
+     * rest, and a wrong draft costs the user one Escape.
+     */
+    const enumerated = /(^|[，,、])\s*[一二三四1234][是.、，]|首先.*其次|一是.*二是/.test(line);
+    if (enumerated) continue;
     return line;
   }
   return "";
@@ -412,10 +493,30 @@ async function predict(ctx, agent, config, feedback, signal) {
   let raw = "";
   const chunks = [];
   let finishKind = null;
+  /*
+   * Token accounting for this call.
+   *
+   * The provider reports `{ type: "usage", usage }` just before `finish`, with
+   * inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens already summed
+   * into totalTokens. Predictions are paid for on every turn, so the settings page
+   * shows the running cost rather than leaving it invisible.
+   *
+   * Absent for some providers, so every field is optional: a missing report must
+   * not read as "this call was free".
+   */
+  let usage = null;
   for await (const chunk of ctx.llm.stream(request)) {
     if (chunks.length < 12) chunks.push(chunk.type);
     if (chunk.type === "text-delta") raw += chunk.text;
-    else if (chunk.type === "finish") {
+    else if (chunk.type === "usage" && chunk.usage !== null && typeof chunk.usage === "object") {
+      const u = chunk.usage;
+      usage = {
+        inputTokens: Number(u.inputTokens) || 0,
+        outputTokens: Number(u.outputTokens) || 0,
+        cacheReadTokens: Number(u.cacheReadTokens) || 0,
+        cacheWriteTokens: Number(u.cacheWriteTokens) || 0,
+      };
+    } else if (chunk.type === "finish") {
       finishKind = chunk.reason.kind;
       if (chunk.reason.kind === "error") {
         // Surface the provider's own words. A silent empty result is
@@ -424,6 +525,7 @@ async function predict(ctx, agent, config, feedback, signal) {
         const failure = chunk.reason.failure;
         return {
           text: "",
+          usage,
           provider: routed.provider,
           model: routed.model,
           error: failure?.code === "QUOTA" || failure?.status === 429
@@ -434,7 +536,7 @@ async function predict(ctx, agent, config, feedback, signal) {
       }
     }
   }
-  return { text: cleanPrediction(raw), provider: routed.provider, model: routed.model, debug: { chunks, finishKind, rawLen: raw.length } };
+  return { text: cleanPrediction(raw), provider: routed.provider, model: routed.model, usage, debug: { chunks, finishKind, rawLen: raw.length } };
 }
 
 /**
@@ -576,59 +678,124 @@ export function apply(ctx, rawConfig) {
   // one prediction.
   const diagnostics = { created: 0, stopping: 0, idle: 0, turnEnd: 0, lastError: null, lastAt: 0 };
 
-  /** Register the turn listeners for one agent; returns its disposer. */
-  function bindAgent(agent) {
-    const sessionId = agent.session.id;
-    let pending = null;
-    /** Highest turn number seen in the current trigger burst. */
-    let scheduledTurn = 0;
-
-    /** Collapse bursts from several triggers into one prediction per turn. */
-    function schedule(reason, turn) {
-      if (pending !== null) clearTimeout(pending);
-      // Keep the highest turn seen in the burst. `agent/status` carries no turn
-      // number, so it must not erase one a sibling trigger already supplied.
-      if (Number.isInteger(turn)) scheduledTurn = Math.max(scheduledTurn, turn);
-      pending = setTimeout(() => {
-        pending = null;
-        const settled = scheduledTurn;
-        scheduledTurn = 0;
-        diagnostics.stopping += 1;
-        diagnostics.lastAt = Date.now();
-        runPrediction(agent, sessionId, settled);
-      }, 400);
-      if (reason === "turn-end") diagnostics.turnEnd += 1;
+  /** Read an agent's session id without letting a disposed agent throw. */
+  function sessionIdOf(agent) {
+    try {
+      const id = agent?.session?.id;
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    } catch {
+      return undefined;
     }
+  }
 
-    // 1) Durable turn boundary. `session/event` is scope-filtered too, so this
-    //    is registered on the agent context as well.
-    const disposeEvent = agent.ctx.on("session/event", (session, event) => {
+  /**
+   * Per-session trigger debounce state.
+   *
+   * Keyed by session id rather than by agent, because the dispatchers deliver the
+   * agent in the payload and one session has exactly one live agent.
+   */
+  const triggerStates = new Map();
+  function triggerState(sessionId, agent) {
+    let state = triggerStates.get(sessionId);
+    if (state === undefined) {
+      state = { pending: null, turn: 0, agent };
+      triggerStates.set(sessionId, state);
+    }
+    state.agent = agent;
+    return state;
+  }
+
+  /** Remember a live agent so a trigger can predict for it later. */
+  function ensureBound(agent) {
+    try {
+      if (!agentDisposers.has(agent)) agentDisposers.set(agent, bindAgent(agent));
+    } catch {
+      /* the agent is going away; the log poll will bind it if it survives */
+    }
+  }
+
+  /**
+   * Collapse the trigger burst for one session into a single prediction.
+   *
+   * A turn emits `agent/turn-stopping`, then `turn/end`, then `agent/status:
+   * idle`. All three describe the same turn, so they are debounced together and
+   * the highest turn number seen wins. The delay is short on purpose: it only
+   * collapses a burst, and every millisecond here is latency the user sees
+   * before the ghost appears.
+   */
+  function scheduleFor(sessionId, reason, turn) {
+    const agent = ctx.agents.get(sessionId);
+    if (agent === undefined) return;
+    const state = triggerState(sessionId, agent);
+    if (Number.isInteger(turn)) state.turn = Math.max(state.turn, turn);
+    if (state.pending !== null) clearTimeout(state.pending);
+    state.pending = setTimeout(() => {
+      state.pending = null;
+      const settled = state.turn;
+      state.turn = 0;
+      diagnostics.stopping += 1;
+      diagnostics.lastAt = Date.now();
+      runPrediction(agent, sessionId, settled);
+    }, 150);
+    if (reason === "turn-end") diagnostics.turnEnd += 1;
+  }
+
+  /**
+   * Register the three turn signals once for the whole plugin.
+   *
+   * They are registered on the PLUGIN's own context, not on `agent.ctx`.
+   *
+   * `agent/status`, `agent/turn-stopping` and `session/event` are dispatched
+   * through `@deepseek-ai/dsh-scope`, whose filter is:
+   *
+   *     scopeIdentityOf(listenerCtx) === undefined || === the emitting identity
+   *
+   * A listener registered on `agent.ctx` carries that agent's tag, so it only
+   * matches its own agent — which sounds right but in practice meant none of
+   * these ever fired, leaving the 2 s log poll as the real trigger and adding up
+   * to two seconds of latency to every suggestion. A listener on an untagged
+   * root context receives them all, so the payload's own `agent` (fused in by
+   * the dispatcher) identifies the session instead.
+   */
+  function bindTriggers() {
+    // 1) The loop's own stopping boundary. Fires before the turn closes, and its
+    //    payload carries the turn number, so it identifies the turn exactly.
+    const disposeStopping = ctx.on("agent/turn-stopping", (payload) => {
+      const agent = payload?.agent;
+      if (agent === undefined) return;
+      const sessionId = sessionIdOf(agent);
+      if (sessionId === undefined) return;
+      ensureBound(agent);
+      scheduleFor(sessionId, "stopping", payload?.turn);
+    });
+
+    // 2) Agent went idle: covers paths that end without a normal turn close.
+    const disposeStatus = ctx.on("agent/status", (payload) => {
+      if (payload?.status !== "idle") return;
+      const agent = payload?.agent;
+      if (agent === undefined) return;
+      const sessionId = sessionIdOf(agent);
+      if (sessionId === undefined) return;
+      ensureBound(agent);
+      diagnostics.idle += 1;
+      scheduleFor(sessionId, "idle");
+    });
+
+    // 3) Durable turn boundary: the appended `turn/end` record.
+    const disposeEvent = ctx.on("session/event", (session, event) => {
       if (event?.type !== "turn/end") return;
       const reason = event.data?.reason;
       // Only a settled turn is worth predicting against; a forked or
       // interrupted turn leaves the conversation mid-thought.
       if (reason?.kind === "forked" || reason?.kind === "aborted" || reason?.kind === "interrupted") return;
-      schedule("turn-end", event.data?.turn);
-    });
-
-    // 2) Agent went idle: covers paths that end without a normal turn close.
-    const disposeStatus = agent.ctx.on("agent/status", (payload) => {
-      if (payload?.status !== "idle") return;
-      diagnostics.idle += 1;
-      schedule("idle");
-    });
-
-    // 3) The loop's own stopping boundary. Its payload carries the turn, which
-    //    is what makes this trigger and the poll agree on the same turn.
-    const disposeStopping = agent.ctx.on("agent/turn-stopping", (payload) => {
-      schedule("stopping", payload?.turn);
+      const sessionId = typeof session?.id === "string" ? session.id : undefined;
+      if (sessionId === undefined) return;
+      const agent = ctx.agents.get(sessionId);
+      if (agent === undefined) return;
+      scheduleFor(sessionId, "turn-end", event.data?.turn);
     });
 
     return () => {
-      if (pending !== null) {
-        clearTimeout(pending);
-        pending = null;
-      }
       disposeEvent();
       disposeStatus();
       disposeStopping();
@@ -636,10 +803,33 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Bumped whenever the composer is submitted.
+   * Track one agent so a trigger or the poll can predict for it.
    *
-   * A prediction started before the submission describes a turn that is already
-   * history; letting it land would drop a stale suggestion into the fresh
+   * This no longer registers listeners: the turn signals are global now (see
+   * `bindTriggers`). What is per-agent is only the bookkeeping, plus cancelling
+   * anything still in flight when the agent goes away.
+   *
+   * @returns a disposer that forgets the agent and aborts its in-flight work.
+   */
+  function bindAgent(agent) {
+    const sessionId = sessionIdOf(agent);
+    if (sessionId === undefined) return () => {};
+    triggerState(sessionId, agent);
+    return () => {
+      const state = triggerStates.get(sessionId);
+      if (state !== undefined && state.pending !== null) {
+        clearTimeout(state.pending);
+        state.pending = null;
+      }
+      triggerStates.delete(sessionId);
+    };
+  }
+
+  /**
+   * Bumped whenever the composer is submitted, dismissed, or cleared.
+   *
+   * A prediction started before that describes a conversation state the user has
+   * already left; letting it land would drop a stale line into the fresh
    * composer. Each attempt records the epoch it began under and discards its own
    * result if the epoch moved on.
    */
@@ -648,6 +838,119 @@ export function apply(ctx, rawConfig) {
   // that same completed turn has already started or finished.
   const predictionUserSeq = new Map();
   const predictionTurnKey = new Map();
+  /**
+   * Texts this session has rejected, and when it last submitted.
+   *
+   * Both live here rather than in the Client because the Client unmounts when the
+   * page switches conversation: a rejection stored there would be forgotten and
+   * the line would come back on the next visit, and a submission instant stored
+   * there would be lost the same way. Keeping them on the Host makes
+   * "this line is rejected" a property of the session, not of one mounted view.
+   */
+  const rejected = new Map();
+  const consumedAt = new Map();
+
+  /**
+   * Remember a rejected text for this session, bounded so it cannot grow.
+   */
+  function reject(sessionId, text) {
+    if (typeof text !== 'string' || text.length === 0) return;
+    const list = rejected.get(sessionId) ?? [];
+    if (list.includes(text)) return;
+    rejected.set(sessionId, [...list, text].slice(-MAX_HISTORY * 4));
+  }
+
+  /**
+   * A small ring of recent bridge requests, plus per-action counters.
+   *
+   * Kept in memory only. It answers "did my mutation actually reach the Host, and
+   * what did it answer" — the question that took a DevTools session to settle the
+   * last time a POST was silently refused.
+   */
+  const requestLog = [];
+  const requestCounts = { get: 0, diag: 0, resetusage: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
+  /**
+   * Token accounting, so the cost of predicting is visible instead of implied.
+   *
+   * Predictions are billed on every turn and the user never sees a number for
+   * them, which is exactly the kind of spend that should be shown rather than
+   * discovered on a bill.
+   *
+   * `recent` keeps the last RECENT_LIMIT calls for the "recent turns" figure; the
+   * totals cover the process lifetime so a long session's cost is answerable.
+   * A call whose provider reported nothing is counted in `unmetered` rather than
+   * as a free one.
+   */
+  const RECENT_LIMIT = 20;
+  const usageTotals = { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, unmetered: 0 };
+  const usageRecent = [];
+
+  /** Fold one call's provider-reported usage into the running figures. */
+  function recordUsage(usage) {
+    usageTotals.calls += 1;
+    if (usage === null || usage === undefined) {
+      usageTotals.unmetered += 1;
+      return;
+    }
+    usageTotals.inputTokens += usage.inputTokens;
+    usageTotals.outputTokens += usage.outputTokens;
+    usageTotals.cacheReadTokens += usage.cacheReadTokens;
+    usageTotals.cacheWriteTokens += usage.cacheWriteTokens;
+    usageRecent.push({
+      at: Date.now(),
+      input: usage.inputTokens,
+      output: usage.outputTokens,
+      cacheRead: usage.cacheReadTokens,
+      cacheWrite: usage.cacheWriteTokens,
+    });
+    if (usageRecent.length > RECENT_LIMIT) usageRecent.splice(0, usageRecent.length - RECENT_LIMIT);
+  }
+
+  /**
+   * The figures the settings page shows.
+   *
+   * `recent` is the trailing window the user asked for; `totals` is the lifetime
+   * of this process. Both are reported because a single number cannot answer both
+   * "what does one turn cost" and "what has this cost me so far".
+   */
+  function usageReport() {
+    const sum = (key, list) => list.reduce((total, item) => total + item[key], 0);
+    /*
+     * Fresh and cached tokens are reported apart rather than folded together.
+     *
+     * A cache read is billed at a discount, so adding it into the fresh count
+     * makes a warm call look more expensive than it is and a cold one look
+     * cheaper. `recentTotal` is therefore the plain attention count — tokens the
+     * model actually read and wrote — with cache shown on its own line.
+     */
+    return {
+      recentCalls: usageRecent.length,
+      recentInput: sum("input", usageRecent),
+      recentOutput: sum("output", usageRecent),
+      recentCacheRead: sum("cacheRead", usageRecent),
+      recentCacheWrite: sum("cacheWrite", usageRecent),
+      recentTotal: sum("input", usageRecent) + sum("output", usageRecent),
+      calls: usageTotals.calls,
+      inputTokens: usageTotals.inputTokens,
+      outputTokens: usageTotals.outputTokens,
+      cacheReadTokens: usageTotals.cacheReadTokens,
+      cacheWriteTokens: usageTotals.cacheWriteTokens,
+      unmeteredCalls: usageTotals.unmetered,
+    };
+  }
+
+  function recordRequest(outcome, action, method, status) {
+    const bucket = Object.hasOwn(requestCounts, action) ? action : "other";
+    requestCounts[bucket] += 1;
+    requestLog.push({
+      at: Date.now(),
+      outcome,
+      action,
+      method,
+      status,
+    });
+    if (requestLog.length > 200) requestLog.splice(0, requestLog.length - 200);
+  }
 
   /**
    * The newest submission sequence, and which turn the log tail describes.
@@ -688,7 +991,16 @@ export function apply(ctx, rawConfig) {
     return { lastUser, turn };
   }
 
-  /** Invalidate in-flight predictions and forget anything pending for a session. */
+  /**
+   * Forget everything pending for a session and cancel work still in flight.
+   *
+   * This is the ONE "invalidate" primitive: a dismissal, a submission and a
+   * composer clear all mean the same thing — whatever the Host is about to
+   * produce belongs to a conversation state the user has already left. Bumping
+   * the epoch makes any in-flight result discard itself even if the adapter
+   * ignores the abort signal, which is why a dismissed line can never come back
+   * a few seconds later.
+   */
   function consumePending(sessionId) {
     dropEpoch.set(sessionId, (dropEpoch.get(sessionId) ?? 0) + 1);
     drafts.delete(sessionId);
@@ -702,6 +1014,11 @@ export function apply(ctx, rawConfig) {
       }
       inflight.delete(sessionId);
     }
+  }
+
+  /** Forget pending work without making the dropped line recallable. */
+  function discardPending(sessionId) {
+    consumePending(sessionId);
   }
 
   /** Ask for a prediction for one agent, superseding any in-flight one. */
@@ -760,6 +1077,7 @@ export function apply(ctx, rawConfig) {
           lastGlobalError = reason;
         } else {
           drafts.set(sessionId, { text: result.text, provider: result.provider, model: result.model, at: Date.now() });
+          recordUsage(result.usage);
           diagnostics.lastError = null;
           lastError.delete(sessionId);
           lastGlobalError = null;
@@ -778,6 +1096,9 @@ export function apply(ctx, rawConfig) {
 
   // Bind every agent that already exists, then every one created later.
   const agentDisposers = new Map();
+  // The turn signals are global (see `bindTriggers`), so they are registered
+  // once here rather than per agent.
+  const disposeTriggers = bindTriggers();
   const offCreated = ctx.on("agent/created", (payload) => {
     const agent = payload?.agent;
     if (agent === undefined) return;
@@ -903,7 +1224,7 @@ export function apply(ctx, rawConfig) {
       diagnostics.lastAt = Date.now();
       runPrediction(agent, sessionId, lastTurn);
     }
-  }, 2000);
+  }, POLL_INTERVAL);
   if (typeof poll.unref === "function") poll.unref();
 
   // ---- Client bridge ----------------------------------------------------
@@ -941,12 +1262,26 @@ export function apply(ctx, rawConfig) {
       } catch {
         return send(503, { ok: false, error: "DSH connection authentication unavailable" });
       }
-      if (rejection !== undefined) return send(rejection === 403 ? 403 : 401, { ok: false, error: "unauthorized" });
-      if (req.method !== "GET" && !req.headers.origin) return send(403, { ok: false, error: "origin required" });
+      if (rejection !== undefined) {
+        recordRequest("rejected", action, req.method, rejection);
+        return send(rejection === 403 ? 403 : 401, { ok: false, error: "unauthorized" });
+      }
+
+      // No separate `Origin` requirement here.
+      //
+      // The page is served from the desktop app's `dsh-app://app` scheme, and its
+      // proxy strips `Origin` before forwarding to this route — so demanding the
+      // header rejected EVERY mutation with 403, which is why dismiss, accept and
+      // send silently never reached the Host. Cross-site forgery is already
+      // covered: the session cookie is `SameSite=Strict`, so another origin's
+      // request carries no credential and `requestRejection` answers 401 above.
 
       try {
         if (action === "get") {
           const sessionId = url.searchParams.get("sessionId") ?? "";
+          // `get` is polled continuously, so it is counted but not logged: it
+          // would drown the mutations that actually explain a bug.
+          requestCounts.get += 1;
           const entry = drafts.get(sessionId);
           const learned = feedback.get(sessionId);
           return send(200, {
@@ -960,6 +1295,14 @@ export function apply(ctx, rawConfig) {
             // Newest first. The Client uses this to offer a recall affordance
             // after the composer has been cleared.
             history: (history.get(sessionId) ?? []).slice(0, MAX_HISTORY),
+            // Texts this session rejected. The Client cannot keep this itself: it
+            // unmounts whenever the page switches conversation, so a rejection
+            // stored there would be forgotten and the line would return on the
+            // next visit. This is the durable answer to "is this line rejected".
+            dismissed: [...(rejected.get(sessionId) ?? [])],
+            // Instant of the last submission. Anything produced at or before it
+            // belongs to the composer the user already left.
+            consumedAt: consumedAt.get(sessionId) ?? 0,
             // Why the last attempt produced nothing, when it did. A session asks
             // for its own reason; the settings page has no session and gets the
             // most recent one instead.
@@ -967,6 +1310,45 @@ export function apply(ctx, rawConfig) {
             learned: learned === undefined
               ? { accepted: 0, dismissed: 0 }
               : { accepted: learned.accepted.length, dismissed: learned.dismissed.length },
+            // What predicting has cost so far, so the spend is visible rather than
+            // only implied by a number on a bill.
+            usage: usageReport(),
+            diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
+          });
+        }
+        if (action === "resetusage") {
+          // Zero the counters. A user comparing "before" and "after" a setting
+          // change needs a way to start counting from now; without it the lifetime
+          // figures only ever grow and stop answering the question.
+          if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
+          usageTotals.calls = 0;
+          usageTotals.inputTokens = 0;
+          usageTotals.outputTokens = 0;
+          usageTotals.cacheReadTokens = 0;
+          usageTotals.cacheWriteTokens = 0;
+          usageTotals.unmetered = 0;
+          usageRecent.length = 0;
+          recordRequest('ok', action, req.method, 200);
+          return send(200, { ok: true, usage: usageReport() });
+        }
+        if (action === "diag") {
+          // A plain GET so it works from any browser tab, a form, or `curl`.
+          //
+          // This exists because a whole class of bugs here is invisible from the
+          // outside: the Client sends a mutation, the Host refuses or never
+          // receives it, and the only symptom is "the ghost came back". Recording
+          // the last few requests makes that visible without DevTools.
+          return send(200, {
+            ok: true,
+            version: PLUGIN_VERSION,
+            requests: requestLog.slice(-40),
+            counts: requestCounts,
+            sessions: {
+              drafts: [...drafts.keys()],
+              rejected: [...rejected.entries()].map(([id, list]) => [id, list.length]),
+              consumedAt: [...consumedAt.entries()],
+              history: [...history.entries()].map(([id, list]) => [id, list.length]),
+            },
             diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
           });
         }
@@ -1044,6 +1426,9 @@ export function apply(ctx, rawConfig) {
           const body = await readJson(req);
           if (typeof body.sessionId === "string") {
             const entry = drafts.get(body.sessionId);
+            // Record the rejection durably, whether or not the draft is still in
+            // the map: the Client reports the exact text it was showing.
+            reject(body.sessionId, typeof body.text === "string" ? body.text : entry?.text);
             // A dismissal is a negative example only when a draft was actually
             // shown; closing the ghost before anything appeared teaches nothing.
             if (entry !== undefined && entry.text.length > 0 && live.adaptive) {
@@ -1052,31 +1437,78 @@ export function apply(ctx, rawConfig) {
               learned.at = Date.now();
               persistFeedback();
             }
-            // A dismissal is final: the line leaves the recall ring in BOTH
-            // cases. Writing a rejected draft back (which is what the "keep it
-            // recallable" branch used to do for a fresh draft) made the next
-            // poll paint it again from `history[0]`, so Escape looked broken.
-            const shown = typeof body.text === "string" ? body.text : undefined;
-            const target = shown ?? (entry === undefined ? undefined : entry.text);
-            if (target !== undefined && target.length > 0) {
-              history.set(
-                body.sessionId,
-                (history.get(body.sessionId) ?? []).filter((item) => item !== target),
-              );
-            }
-            drafts.delete(body.sessionId);
+            // A dismissal is final AND cancels work still in flight. Without the
+            // cancellation a prediction that was already running when Esc was
+            // pressed would land a moment later and paint the rejected line back
+            // — the "I deleted it and it came back" behaviour.
+            consumePending(body.sessionId);
           }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "drop") {
-          // The user sent their own message instead of taking the suggestion.
-          // The pending draft is now stale: remove it without recording feedback
-          // and without making it recallable, because it was never acted on.
-          // Any prediction still in flight belongs to the previous composer and
-          // is invalidated too.
+          // The composer went empty. Decide which of the two cases it was.
+          //
+          // The Client cannot tell: `InputState.phase` is `plain` for an ordinary
+          // send too, and the composer clears before this process has appended the
+          // `user/message` that proves a send. So the log is the only authority,
+          // and it is read HERE, on the Host, where the append has already
+          // happened by the time the request arrives in practice.
+          //
+          //   a `user/message` appeared since the last prediction
+          //     -> a send: forget the draft and the ring, nothing should return.
+          //   nothing new in the log
+          //     -> a manual clear (Tab-then-clear, or typing then deleting):
+          //        forget only the pending draft, keep the ring so the ghost
+          //        comes straight back.
           if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
           const body = await readJson(req);
-          if (typeof body.sessionId === "string") consumePending(body.sessionId);
+          if (typeof body.sessionId === "string") {
+            const sessionId = body.sessionId;
+            let submitted = false;
+            const agent = ctx.agents.get(sessionId);
+            if (agent !== undefined) {
+              try {
+                const boundary = logBoundary(agent.session);
+                submitted = boundary.lastUser > (predictionUserSeq.get(sessionId) ?? -1);
+              } catch {
+                /* no readable log: treat it as a manual clear, the safer default */
+              }
+            }
+            // A Client that knows better may say so, but only to override the
+            // default when the log could not be read at all.
+            if (typeof body.submitted === "boolean" && agent === undefined) submitted = body.submitted;
+
+            if (submitted) {
+              consumedAt.set(sessionId, Date.now());
+              rejected.set(sessionId, []);
+              drafts.delete(sessionId);
+              history.delete(sessionId);
+            } else {
+              // Manual clear: the line was never acted on, so it stays available.
+              // Move the pending draft into the ring so `history[0]` can answer
+              // immediately, then drop the draft itself; the Client paints
+              // `suggestion ?? history[0]`, so the ghost returns on the next read
+              // without waiting for a new prediction.
+              const pending = drafts.get(sessionId);
+              if (pending !== undefined && pending.text.length > 0) {
+                history.set(sessionId, pushHistory(history.get(sessionId), pending.text));
+                drafts.delete(sessionId);
+              }
+              // Invalidate anything still in flight for the composer just left.
+              dropEpoch.set(sessionId, (dropEpoch.get(sessionId) ?? 0) + 1);
+            }
+            const prior = inflight.get(sessionId);
+            if (prior !== undefined) {
+              try {
+                prior.abort();
+              } catch {
+                /* already settled */
+              }
+              inflight.delete(sessionId);
+            }
+          }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "accepted") {
@@ -1097,6 +1529,7 @@ export function apply(ctx, rawConfig) {
             // Clear the ghost either way; the text now lives in the composer.
             drafts.delete(body.sessionId);
           }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "reset") {
@@ -1105,6 +1538,7 @@ export function apply(ctx, rawConfig) {
           if (typeof body.sessionId === "string" && body.sessionId.length > 0) feedback.delete(body.sessionId);
           else feedback.clear();
           persistFeedback();
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         return send(404, { ok: false, error: `unknown action: ${action}` });
@@ -1122,6 +1556,10 @@ export function apply(ctx, rawConfig) {
     dropEpoch.clear();
     predictionUserSeq.clear();
     predictionTurnKey.clear();
+    rejected.clear();
+    consumedAt.clear();
+    triggerStates.clear();
+    disposeTriggers();
     offCreated();
     offDisposed();
     for (const dispose of agentDisposers.values()) {
@@ -1187,3 +1625,9 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
+
+
+
+
+

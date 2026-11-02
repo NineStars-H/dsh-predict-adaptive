@@ -8,77 +8,529 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SOURCE = readFileSync(join(root, 'client.js'), 'utf8');
 
 /**
- * Run the overlay component body against stand-in React bindings.
+ * Execute the real overlay against stand-in React and a fake composer.
  *
- * `node --check` only proves the file parses. The browser half is never imported
- * by any other test, so a temporal-dead-zone read or a bad destructure inside
- * the component would ship undetected and blank the ghost entirely — which is
- * exactly what happened once. This executes it for real.
+ * `node --check` only proves the file parses, and nothing else imports this
+ * half, so a temporal-dead-zone read or a mistake in the hook plumbing would
+ * ship silently and simply render nothing. These tests run the component body
+ * for real.
+ *
+ * The stand-ins model the parts of React that matter here — hook call order,
+ * dependency comparison, ref persistence, reducer re-render — because getting
+ * those wrong earlier made the tests pass or fail for unrelated reasons.
  */
-async function renderOverlay({ draft = '', phase = 'plain', sessionId = 's1' } = {}) {
-  const effects = [];
-  const React = {
-    useRef: (value) => ({ current: value }),
-    useState: (value) => [value, () => {}],
-    useEffect: (fn) => { effects.push(fn); },
-    useCallback: (fn) => fn,
-  };
-  const h = (type, props, ...children) => ({ type, props, children });
 
-  // The component schedules its poll with `window.setTimeout` and talks to the
-  // Host over `fetch`; neither exists in Node. The timer is a no-op so no poll
-  // loop outlives the test, and `fetch` resolves to an empty reply. The
-  // stand-ins stay installed for the whole test body: the mount effect starts an
-  // async poll whose continuation runs after the synchronous part returns.
-  const timers = [];
-  const previousWindow = globalThis.window;
-  const previousFetch = globalThis.fetch;
-  globalThis.window = {
-    setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
-    clearTimeout: () => {},
-  };
-  globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
-
-  const start = SOURCE.indexOf('function PredictionOverlay');
-  assert.ok(start >= 0, 'PredictionOverlay must exist in client.js');
+/** Extract one top-level function body by brace matching. */
+function extractFunction(name) {
+  const start = SOURCE.indexOf(`function ${name}`);
+  assert.ok(start >= 0, `${name} must exist in client.js`);
   let depth = 0;
-  let end = -1;
   for (let i = SOURCE.indexOf('{', start); i < SOURCE.length; i += 1) {
     if (SOURCE[i] === '{') depth += 1;
     else if (SOURCE[i] === '}') {
       depth -= 1;
-      if (depth === 0) { end = i + 1; break; }
+      if (depth === 0) return SOURCE.slice(start, i + 1);
     }
   }
-  assert.ok(end > start, 'PredictionOverlay body must be brace-balanced');
-
-  // eslint-disable-next-line no-new-func -- the point is to execute the real body
-  const factory = new Function('React', 'h', 'ROUTE', 'copy', `return (${SOURCE.slice(start, end)});`);
-  const Overlay = factory(React, h, '/prompt-predict-adaptive', () => ({}));
-
-  const props = {
-    sessionId,
-    inputActions: { captureInsertion: () => ({}), insertText: () => true, setDraft: () => {} },
-    useInput: (selector) => selector({ draft, phase, attachmentIds: [], draftRev: 0 }),
-  };
-  const tree = Overlay(props);
-  for (const fn of effects) fn();
-  // Let the poll's continuation settle while the stand-ins are still installed.
-  await new Promise((resolve) => setImmediate(resolve));
-  globalThis.window = previousWindow;
-  globalThis.fetch = previousFetch;
-  return { tree, timers: timers.length };
+  throw new Error(`${name} is not brace-balanced`);
 }
 
-test('the ghost overlay renders without runtime errors', async () => {
-  // An empty composer with no suggestion yet: the component must return null,
-  // not throw. A throw here is invisible in the host UI — it just means no ghost.
-  const { tree } = await renderOverlay();
-  assert.equal(tree, null);
+/**
+ * Mount the overlay.
+ *
+ * @param {object} options - Host reply, composer state and starting time.
+ * @returns handles for driving the component.
+ */
+async function mount({
+  draft = '',
+  phase = 'plain',
+  sessionId = 's1',
+  suggestion = null,
+  ring = [],
+  dismissed = [],
+  consumedAt = 0,
+  hostState = null,
+  pending = [],
+  now = 1_000,
+} = {}) {
+  const stateSlots = [];
+  const refSlots = [];
+  const callbackSlots = [];
+  const effectSlots = [];
+  const cleanups = [];
+  let stateCursor = 0;
+  let refCursor = 0;
+  let callbackCursor = 0;
+  let rendering = false;
+  let queued = false;
+  let tree = null;
+  let clock = now;
+  let keydown = null;
+  let hostReply = {
+    suggestion,
+    history: ring,
+    dismissed,
+    consumedAt,
+  };
+  void hostState;
+  /** The live submission echo list; a test may change it to model a retirement. */
+  let pendingNow = pending;
+  /** Timers the component scheduled; the poll loop is driven by these. */
+  const timers = [];
+
+  const scheduleRender = () => {
+    if (rendering) { queued = true; return; }
+    queueMicrotask(() => { void render(); });
+  };
+
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props, children }),
+    useRef: (value) => {
+      const index = refCursor;
+      refCursor += 1;
+      if (!(index in refSlots)) refSlots[index] = { current: value };
+      return refSlots[index];
+    },
+    useState: (value) => {
+      const index = stateCursor;
+      stateCursor += 1;
+      // React treats a function argument as a lazy initialiser.
+      if (!(index in stateSlots)) stateSlots[index] = typeof value === 'function' ? value() : value;
+      const set = (next) => {
+        const resolved = typeof next === 'function' ? next(stateSlots[index]) : next;
+        if (Object.is(resolved, stateSlots[index])) return;
+        stateSlots[index] = resolved;
+        scheduleRender();
+      };
+      return [stateSlots[index], set];
+    },
+    useReducer: (reducer, initial) => {
+      const index = stateCursor;
+      stateCursor += 1;
+      if (!(index in stateSlots)) stateSlots[index] = initial;
+      const dispatch = (action) => {
+        const resolved = reducer(stateSlots[index], action);
+        if (Object.is(resolved, stateSlots[index])) return;
+        stateSlots[index] = resolved;
+        scheduleRender();
+      };
+      return [stateSlots[index], dispatch];
+    },
+    useMemo: (fn) => fn(),
+    useEffect: (fn, deps) => {
+      effectSlots.push({ fn, deps: deps === undefined ? null : deps });
+    },
+    useCallback: (fn, deps) => {
+      const index = callbackCursor;
+      callbackCursor += 1;
+      const previous = callbackSlots[index];
+      const changed =
+        previous === undefined ||
+        deps === undefined ||
+        previous.deps === undefined ||
+        deps.length !== previous.deps.length ||
+        deps.some((value, i) => !Object.is(value, previous.deps[i]));
+      if (changed) callbackSlots[index] = { fn, deps };
+      return callbackSlots[index].fn;
+    },
+  };
+
+  // The composer's placeholder element: the component only toggles its
+  // `visibility`, never its text (React owns that text node).
+  const placeholderNode = { textContent: 'Ask anything…', isConnected: true, style: { visibility: '' } };
+  placeholderNode.parentNode = {};
+
+  const previousGlobals = {
+    document: globalThis.document,
+    window: globalThis.window,
+    fetch: globalThis.fetch,
+  };
+  globalThis.document = {
+    documentElement: { lang: 'en' },
+    querySelector: () => placeholderNode,
+    querySelectorAll: (selector) => (selector === '[data-composer-placeholder]' ? [placeholderNode] : []),
+    addEventListener: (type, listener) => {
+      if (type === 'keydown') keydown = listener;
+    },
+    removeEventListener() {},
+  };
+  globalThis.window = {
+    setTimeout: (fn) => { timers.push({ fn }); return timers.length; },
+    clearTimeout: () => { timers.length = 0; },
+  };
+  // Each `/get` records the reply it answered with, so a test can tell whether
+  // the poll has actually returned the new state yet.
+  let pollCount = 0;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/get')) {
+      pollCount += 1;
+      return { ok: true, json: async () => hostReply };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+
+  // The component reads the module-level `styles` table, so the extracted body
+  // needs it in scope the way the real module provides it.
+  const stylesSource = extractFunction('copy');
+  void stylesSource;
+  const stylesMatch = /const styles = \{[\s\S]*?\n    \};/.exec(SOURCE);
+  assert.ok(stylesMatch, 'the styles table must exist in client.js');
+  // The component closes over module-level constants, so they are read from the
+  // source rather than duplicated here — a copy would drift and the test would
+  // stop proving anything about the shipped file.
+  const idlePoll = /const IDLE_POLL_MS = (\d+);/.exec(SOURCE);
+  assert.ok(idlePoll, 'IDLE_POLL_MS must exist in client.js');
+  const body = `${stylesMatch[0]}\nconst IDLE_POLL_MS = ${idlePoll[1]};\n${extractFunction('PredictionOverlay')}\nreturn PredictionOverlay;`;
+  // eslint-disable-next-line no-new-func -- the point is to execute the real body
+  const factory = new Function('React', 'h', 'ROUTE', 'PLACEHOLDER', 'Date', body);
+  const FakeDate = class extends Date {
+    static now() { return clock; }
+  };
+  const Overlay = factory(
+    React,
+    React.createElement,
+    '/prompt-predict-adaptive',
+    '[data-composer-placeholder]',
+    FakeDate,
+  );
+
+  const render = async () => {
+    if (rendering) { queued = true; return; }
+    rendering = true;
+    const before = effectSlots.slice();
+    effectSlots.length = 0;
+    stateCursor = 0;
+    refCursor = 0;
+    callbackCursor = 0;
+    try {
+      tree = Overlay({
+        sessionId,
+        inputActions: { captureInsertion: () => ({}), insertText: () => true, setDraft: () => {} },
+        useInput: (selector) => selector({ draft, phase, attachmentIds: [], draftRev: 0 }),
+        // The live submission list: non-empty means a send is in flight.
+        useSession: (selector) => selector({ pendingSubmissions: pendingNow }),
+      });
+    } finally {
+      rendering = false;
+    }
+    effectSlots.forEach((slot, index) => {
+      const prior = before[index];
+      const changed =
+        prior === undefined ||
+        slot.deps === null ||
+        prior.deps === null ||
+        slot.deps.length !== prior.deps.length ||
+        slot.deps.some((value, i) => !Object.is(value, prior.deps[i]));
+      if (!changed) {
+        prior.cleanup = prior.cleanup;
+        slot.cleanup = prior.cleanup;
+        return;
+      }
+      // React runs the previous cleanup before the next effect. Skipping that
+      // leaves a stale cleanup holding the old DOM state, so the placeholder
+      // would stay hidden after a dismissal.
+      if (typeof prior?.cleanup === 'function') {
+        prior.cleanup();
+        prior.cleanup = undefined;
+      }
+      const cleanup = slot.fn();
+      slot.cleanup = typeof cleanup === 'function' ? cleanup : undefined;
+      if (slot.cleanup !== undefined) cleanups.push(slot.cleanup);
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    if (queued) { queued = false; await render(); }
+  };
+
+  await render();
+  for (let i = 0; i < 4; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  if (queued) { queued = false; await render(); }
+
+  /** The text painted on screen, or null when nothing is shown. */
+  const shownText = () => (tree === null ? null : tree.children[0].children[0]);
+
+  return {
+    get tree() { return tree; },
+    shownText,
+    /** The inline style of the suggestion text itself. */
+    textStyle: () => (tree === null ? null : tree.children[0].props.style),
+    /** The inline style of the wrapper row. */
+    rowStyle: () => (tree === null ? null : tree.props.style),
+    placeholderVisibility: () => placeholderNode.style.visibility,
+    setHostReply: (next) => { hostReply = next; },
+    /** Replace the live submission echo list, as the session does when it retires. */
+    setPending: (next) => { pendingNow = next; scheduleRender(); },
+    advanceClock: (ms) => { clock += ms; },
+    press(key) {
+      const event = {
+        key,
+        shiftKey: false,
+        altKey: false,
+        ctrlKey: false,
+        metaKey: false,
+        prevented: false,
+        stopped: false,
+        preventDefault() { this.prevented = true; },
+        stopPropagation() { this.stopped = true; },
+      };
+      keydown?.(event);
+      return event;
+    },
+    /**
+     * Let the component observe a new Host reply.
+     *
+     * The poll is driven by a timer the component schedules itself; the stand-in
+     * `setTimeout` records it instead of scheduling, so this runs it and lets the
+     * resulting state updates commit.
+     */
+    async pollOnce() {
+      const before = pollCount;
+      const pending = timers.splice(0);
+      for (const timer of pending) timer.fn();
+      for (let i = 0; i < 10 && pollCount === before; i += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
+      if (queued) { queued = false; await render(); }
+    },
+    async settle() {
+      for (let i = 0; i < 8; i += 1) await new Promise((resolve) => setImmediate(resolve));
+      if (queued) { queued = false; await render(); }
+    },
+    /**
+     * Drain only the microtask queue.
+     *
+     * React commits a state update before the browser paints, so a synchronous
+     * handler's effect on the DOM is observable after microtasks — without
+     * waiting for any macrotask a fetch would need.
+     */
+    async flushMicrotasks() {
+      for (let i = 0; i < 4; i += 1) await Promise.resolve();
+      // The scheduled render runs on a microtask; commit it before asserting.
+      if (queued) { queued = false; await render(); }
+    },
+    async dispose() {
+      globalThis.fetch = async () => ({ ok: false, json: async () => ({}) });
+      for (const cleanup of cleanups.splice(0)) {
+        try {
+          cleanup();
+        } catch {
+          /* tearing down anyway */
+        }
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+      globalThis.document = previousGlobals.document;
+      globalThis.window = previousGlobals.window;
+      globalThis.fetch = previousGlobals.fetch;
+    },
+  };
+}
+
+test('paints nothing when the Host has no suggestion', async () => {
+  const app = await mount();
+  try {
+    assert.equal(app.tree, null);
+    assert.notEqual(app.placeholderVisibility(), 'hidden');
+  } finally {
+    await app.dispose();
+  }
 });
 
-test('the ghost overlay survives every composer phase', async () => {
-  await assert.doesNotReject(() => renderOverlay({ draft: '', phase: 'plain', sessionId: 's1' }));
-  await assert.doesNotReject(() => renderOverlay({ draft: 'user is typing', phase: 'plain' }));
-  await assert.doesNotReject(() => renderOverlay({ draft: '', phase: 'adjudicating' }));
+test('paints the suggestion and hides the host placeholder', async () => {
+  const app = await mount({ suggestion: { text: 'run the tests', at: 2_000 } });
+  try {
+    assert.equal(app.shownText(), 'run the tests');
+    assert.equal(app.placeholderVisibility(), 'hidden');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('Escape drops the line in the same frame', async () => {
+  const app = await mount({ suggestion: { text: 'commit it', at: 2_000 } });
+  try {
+    assert.equal(app.shownText(), 'commit it');
+    const event = app.press('Escape');
+    // React commits the state update and runs the cleanup that restores the
+    // placeholder before the browser paints, so both are asserted here without
+    // waiting for any macrotask a fetch would need.
+    await app.flushMicrotasks();
+    assert.equal(app.shownText(), null, 'the ghost is gone');
+    assert.equal(app.placeholderVisibility(), '', 'the official placeholder is back');
+    assert.equal(event.prevented, true, 'the host must not also handle this Escape');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a rejected line never comes back, however often the Host repeats it', async () => {
+  const app = await mount({ suggestion: { text: 'commit it', at: 2_000 } });
+  try {
+    app.press('Escape');
+    // The Host has not processed the dismissal yet and keeps reporting the same
+    // line. Only a time window used to hide that; now the rejection is recorded.
+    app.setHostReply({ suggestion: { text: 'commit it', at: 2_000 }, history: ['commit it'] });
+    await app.settle();
+    assert.equal(app.shownText(), null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a rejected line stays rejected after the page remounts', async () => {
+  // Switching conversation unmounts this component and mounts a fresh one. The
+  // rejection must therefore live on the Host: when it did not, a dismissed line
+  // came back on the next visit, which read as "Escape only works until I switch".
+  const host = { suggestion: { text: 'commit it', at: 2_000 }, history: [], dismissed: [], consumedAt: 0 };
+  const first = await mount({ ...host, hostState: host });
+  try {
+    first.press('Escape');
+    await first.flushMicrotasks();
+    assert.equal(first.shownText(), null);
+  } finally {
+    await first.dispose();
+  }
+
+  // The Host recorded the rejection; the remounted component learns it from the
+  // regular reply and refuses to paint the same line again.
+  const second = await mount({
+    suggestion: { text: 'commit it', at: 2_000 },
+    history: ['commit it'],
+    dismissed: ['commit it'],
+  });
+  try {
+    assert.equal(second.shownText(), null, 'the rejected line does not return');
+  } finally {
+    await second.dispose();
+  }
+});
+
+test('a line produced before the last send is not painted after a remount', async () => {
+  // The send instant is durable for the same reason: without it, reopening the
+  // conversation showed a suggestion that belonged to the composer already left.
+  const app = await mount({
+    suggestion: { text: 'stale line', at: 1_500 },
+    consumedAt: 5_000,
+  });
+  try {
+    assert.equal(app.shownText(), null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('the ghost does not blink back after the submission echo retires', async () => {
+  // Pressing send hides it, then the Host adopts the message and the local echo
+  // retires. If the visibility rule only watched the echo, that retirement would
+  // paint the old draft again until the next poll dropped it — a visible blink.
+  // The send therefore also has to record that this composer is finished with.
+  const app = await mount({
+    suggestion: { text: 'run the tests', at: 2_000 },
+    pending: [{ requestId: 'r1', placement: 'transcript', text: 'run the tests' }],
+  });
+  try {
+    assert.equal(app.tree, null, 'hidden while the echo is live');
+
+    // The echo retires: the list empties, but the Host has not answered the poll
+    // yet and still reports the old draft.
+    app.setPending([]);
+    await app.settle();
+    assert.equal(app.shownText(), null, 'it must not blink back');
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('Escape keeps working for a second suggestion', async () => {
+  const app = await mount({ suggestion: { text: 'first line', at: 2_000 } });
+  try {
+    app.press('Escape');
+    await app.flushMicrotasks();
+    assert.equal(app.shownText(), null, 'first line dismissed');
+    // A genuinely new suggestion arrives. Its timestamp must be after anything
+    // this half has consumed — and nothing is consumed by a dismissal, only by a
+    // send — so a later stamp is always accepted.
+    app.advanceClock(10);
+    app.setHostReply({ suggestion: { text: 'second line', at: 9_000 }, history: [] });
+    await app.pollOnce();
+    assert.equal(app.shownText(), 'second line', 'a later suggestion is shown');
+    // The listener survived the first dismissal, so this one still reaches us;
+    // when it unmounted with the ghost, the second Escape fell through to the
+    // host and the line stayed on screen.
+    app.press('Escape');
+    await app.flushMicrotasks();
+    assert.equal(app.shownText(), null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('a suggestion never paints over text the user is typing', async () => {
+  const app = await mount({ draft: 'half typed', suggestion: { text: 'run the tests', at: 2_000 } });
+  try {
+    assert.equal(app.tree, null);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('the ghost disappears the moment a submission starts', async () => {
+  // Between pressing send and the model answering there is a gap. The Host has
+  // not answered the next poll yet, so the old draft is still in hand — but the
+  // composer is no longer waiting for a suggestion, and the ghost must not be
+  // painted across it. `pendingSubmissions` is the signal that appears on the
+  // click's own frame, before the prompt is even serialised.
+  const idle = await mount({ suggestion: { text: 'run the tests', at: 2_000 } });
+  try {
+    assert.equal(idle.shownText(), 'run the tests');
+  } finally {
+    await idle.dispose();
+  }
+
+  const sending = await mount({
+    suggestion: { text: 'run the tests', at: 2_000 },
+    pending: [{ requestId: 'r1', placement: 'transcript', text: 'run the tests' }],
+  });
+  try {
+    assert.equal(sending.tree, null, 'hidden while the submission is in flight');
+    assert.notEqual(sending.placeholderVisibility(), 'hidden', 'and the placeholder is free again');
+  } finally {
+    await sending.dispose();
+  }
+});
+
+test('a long suggestion is clamped to two lines instead of overflowing', async () => {
+  // The host anchors overlays at a zero-height seat, so the ghost takes no part in
+  // layout and cannot grow the card. Anything past the second line would cover the
+  // toolbar underneath, so the text clamps to two lines with an ellipsis.
+  const long = Array.from({ length: 12 }, (_, i) => `line ${i + 1} of the suggestion`).join('\n');
+  const app = await mount({ suggestion: { text: long, at: 2_000 } });
+  try {
+    const text = app.textStyle();
+    assert.equal(text.WebkitLineClamp, '2', 'clamped to two lines');
+    assert.equal(text.display, '-webkit-box', 'the clamp needs a box display');
+    assert.equal(text.overflow, 'hidden', 'and must actually clip');
+    assert.equal(text.textOverflow, 'ellipsis', 'the cut is marked, not silent');
+
+    // The row must stay a row: the clamp lives on the text, not the container, or
+    // the Tab badge would be swallowed by the box.
+    const row = app.rowStyle();
+    assert.equal(row.display, 'flex');
+    assert.equal(row.position, 'absolute', 'anchored like the host placeholder');
+
+    // The text is still complete in the DOM, so Tab can insert all of it.
+    assert.equal(app.shownText(), long);
+  } finally {
+    await app.dispose();
+  }
+});
+
+test('survives every composer phase without throwing', async () => {
+  for (const phase of ['plain', 'claimed', 'submitting', 'adjudicating']) {
+    const app = await mount({ phase, suggestion: { text: 'x', at: 2_000 } });
+    try {
+      assert.ok(app.tree === null || typeof app.shownText() === 'string');
+    } finally {
+      await app.dispose();
+    }
+  }
 });

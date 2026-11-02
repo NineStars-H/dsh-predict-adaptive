@@ -8,19 +8,31 @@ import { apply } from '../index.js';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events } = {}) {
+function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events, onStream, nodes } = {}) {
   const listeners = new Map();
   let route, dispose;
   const agent = {
-    session: { id: 's1', get seq() { return events?.length ?? 1; }, surface: { nodes: [0] }, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), eventAt: (seq) => events?.[seq] ?? {}, deriveEventMessage: () => ({ role: 'user', content: 'hello' }) },
+    session: { id: 's1', get seq() { return events?.length ?? 1; }, surface: { nodes: nodes ?? [0] }, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), eventAt: (seq) => events?.[seq] ?? {}, deriveEventMessage: (event) => (event?.data?.role !== undefined ? event.data : { role: 'user', content: 'hello' }) },
     ctx: { on: (name, fn) => { listeners.set(name, fn); return () => listeners.delete(name); } },
   };
   const connection = auth && { requestRejection: auth };
+  // The plugin registers its turn signals on its own context, so these are the
+  // listeners the tests drive. Each listener records the last registration per
+  // event name.
+  const globalListeners = new Map();
   const ctx = {
     get: (key) => key === 'connection' ? connection : undefined,
-    llm: { stream: stream ?? (async function* () { yield { type: 'text-delta', text: 'Continue testing' }; }) },
+    // `onStream` lets a test inspect the request the plugin would have sent, which
+    // is the only way to assert on prompt shape without a live provider.
+    llm: {
+      stream: async function* (request) {
+        onStream?.(request);
+        if (stream !== undefined) { yield* stream(request); return; }
+        yield { type: 'text-delta', text: 'Continue testing' };
+      },
+    },
     agents: { list: () => [agent], get: () => agent },
-    on: () => () => {},
+    on: (name, fn) => { globalListeners.set(name, fn); return () => globalListeners.delete(name); },
     webServer: { register: (r) => { route = r.handler; return () => {}; } },
     effect: (fn) => { dispose = fn(); },
   };
@@ -31,8 +43,9 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
   finally { globalThis.setInterval = originalInterval; }
   return {
     dispose: () => dispose(),
-    trigger: () => listeners.get('agent/status')({ status: 'idle' }),
-    stopping: (turn) => listeners.get('agent/turn-stopping')({ turn }),
+    // The dispatcher fuses the owning agent into every payload.
+    trigger: () => globalListeners.get('agent/status')?.({ agent, status: 'idle' }),
+    stopping: (turn) => globalListeners.get('agent/turn-stopping')?.({ agent, turn }),
     poll: () => poll(),
     async request(path, { method = 'GET', cookie = 'valid', origin = 'http://localhost', body } = {}) {
       const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -53,7 +66,15 @@ test('authentication is required and unavailable authentication fails closed', a
       assert.equal((await h.request(action, { method: 'POST', cookie: '', body: {} })).status, 401);
     }
     assert.equal((await h.request('get', { origin: 'http://evil' })).status, 403);
-    assert.equal((await h.request('config', { method: 'POST', origin: null, body: {} })).status, 403);
+    // A mutation WITHOUT an Origin header must still be admitted.
+    //
+    // The desktop page is served from `dsh-app://app`, and its proxy strips
+    // Origin before forwarding to this route. Requiring the header therefore
+    // rejected every mutation with 403, which is why dismiss, accept and send
+    // silently never reached the Host. Forgery is covered by the SameSite=Strict
+    // session cookie: another origin's request carries no credential and fails
+    // the `requestRejection` check above with 401.
+    assert.equal((await h.request('config', { method: 'POST', origin: null, body: {} })).status, 200);
     assert.equal((await h.request('get')).status, 200);
     assert.equal((await h.request('diagnose')).status, 405);
   } finally { h.dispose(); }
@@ -61,6 +82,163 @@ test('authentication is required and unavailable authentication fails closed', a
   try { assert.equal((await unavailable.request('get')).status, 503); } finally { unavailable.dispose(); }
   const throws = harness({ auth: () => { throw Error('unavailable'); } });
   try { assert.equal((await throws.request('get')).status, 503); } finally { throws.dispose(); }
+});
+
+test('the transcript ends on an open USER turn so the model finishes a line', async () => {
+  // Without the dangling label the input reads as a finished document plus a
+  // task, and the model answers in an analyst's voice — a plan, or a restatement
+  // of the assistant's last message — instead of the next thing the user types.
+  const requests = [];
+  const events = [
+    { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: 'fix the parser' }] } },
+    { type: 'assistant/message', data: { role: 'assistant', content: [{ type: 'text', text: 'Done, tests pass.' }] } },
+  ];
+  const h = harness({ events, nodes: [0, 1], onStream: (request) => requests.push(request) });
+  try {
+    h.trigger(); await delay(450);
+    assert.equal(requests.length, 1, 'the model was asked once');
+    const prompt = requests[0].messages[0].content[0].text;
+    assert.ok(prompt.trimEnd().endsWith('USER:'), 'the transcript ends with an open USER turn');
+    assert.ok(prompt.includes('ASSISTANT: Done, tests pass.'), 'and still carries the reply above it');
+  } finally { h.dispose(); }
+});
+
+test('a to-do list handed to the user is not offered as a prediction', async () => {
+  // The reported failure: a draft that read like the assistant's next step.
+  // An unambiguous list shape is rejected; an ordinary request is kept.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: '一是不压工具栏，二是预测不编造。' }; } });
+  try {
+    h.trigger(); await delay(450);
+    const draft = (await h.request('get?sessionId=s1')).body.suggestion;
+    assert.equal(draft, null, 'the enumerated list is rejected');
+  } finally { h.dispose(); }
+
+  const ok = harness({ stream: async function* () { yield { type: 'text-delta', text: '把 adaptive 学习关掉再出一版给我对比。' }; } });
+  try {
+    ok.trigger(); await delay(450);
+    const draft = (await ok.request('get?sessionId=s1')).body.suggestion;
+    assert.equal(draft?.text, '把 adaptive 学习关掉再出一版给我对比。', 'a normal request survives');
+  } finally { ok.dispose(); }
+});
+
+test('prediction cost is counted and can be reset', async () => {
+  // Predictions are billed every turn and show nothing in the transcript, so the
+  // plugin reports the spend instead of leaving it to be discovered later.
+  const stream = async function* () {
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 20, cacheReadTokens: 800, cacheWriteTokens: 0 } };
+    yield { type: 'text-delta', text: 'commit it' };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  };
+  const h = harness({ stream });
+  try {
+    h.trigger(); await delay(450);
+    let usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 1, 'one billed call');
+    assert.equal(usage.inputTokens, 1000);
+    assert.equal(usage.outputTokens, 20);
+    assert.equal(usage.cacheReadTokens, 800, 'cache reads are reported separately');
+    assert.equal(usage.unmeteredCalls, 0);
+
+    h.trigger(); await delay(450);
+    usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 2, 'the total accumulates');
+    assert.equal(usage.inputTokens, 2000);
+    assert.equal(usage.recentCalls, 2);
+    // Two calls of 1000 in + 20 out. Cache reads are tracked but excluded from
+    // this figure: they are billed at a discount, so folding them in would
+    // misstate what a warm call costs.
+    assert.equal(usage.recentTotal, 2040);
+    assert.equal(usage.recentCacheRead, 1600);
+
+    const reset = await h.request('resetusage', { method: 'POST', body: {} });
+    assert.equal(reset.status, 200);
+    const after = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(after.calls, 0, 'the counter can be zeroed to compare settings');
+    assert.equal(after.inputTokens, 0);
+  } finally { h.dispose(); }
+});
+
+test('a provider that reports no usage is counted as unmetered, not as free', async () => {
+  // An absent report must not look like a zero-cost call.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'x' }; } });
+  try {
+    h.trigger(); await delay(450);
+    const usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 1);
+    assert.equal(usage.unmeteredCalls, 1);
+    assert.equal(usage.inputTokens, 0);
+  } finally { h.dispose(); }
+});
+
+test('a manual clear recalls the line while a send clears it', async () => {
+  // Both transitions empty the composer, so the Client cannot tell them apart and
+  // reports nothing but "the composer is empty". The Host decides from the
+  // session log: a send appended a `user/message`, a manual clear did not.
+  const events = [];
+  const h = harness({ events });
+  try {
+    h.trigger(); await delay(450);
+    const first = (await h.request('get?sessionId=s1')).body.suggestion;
+    await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });
+
+    // Manual clear: the log gained nothing.
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    const cleared = (await h.request('get?sessionId=s1')).body;
+    assert.equal(cleared.suggestion ?? cleared.history[0], first.text, 'the line is painted again');
+    assert.deepEqual(cleared.history, [first.text], 'and it is recallable');
+
+    // A real send: the log gains a user message, which is the proof.
+    h.trigger(); await delay(450);
+    events.push({ type: 'user/message' });
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    const sent = (await h.request('get?sessionId=s1')).body;
+    assert.deepEqual(sent.history, [], 'a send leaves nothing to recall');
+    assert.equal(sent.suggestion, null);
+  } finally { h.dispose(); }
+});
+
+test('every mutation works when the desktop proxy has stripped Origin', async () => {
+  // This is the regression that mattered.
+  //
+  // The page is served from `dsh-app://app`; Electron's proxy deletes `origin`
+  // (and rewrites host and cookie) before forwarding here. A rule requiring the
+  // header for non-GET requests therefore answered 403 to every mutation, so
+  // dismiss, accept and send silently never reached the Host — and the visible
+  // symptom was only "the ghost came back".
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    const suggestion = (await h.request('get?sessionId=s1')).body.suggestion;
+    assert.ok(suggestion !== null, 'a suggestion exists to act on');
+
+    // Each of these is what the Client sends through the proxy: no Origin.
+    for (const action of ['dismiss', 'accepted', 'drop', 'reset']) {
+      const response = await h.request(action, {
+        method: 'POST',
+        origin: null,
+        body: { sessionId: 's1', text: suggestion.text },
+      });
+      assert.equal(response.status, 200, `${action} must be admitted without an Origin header`);
+    }
+  } finally { h.dispose(); }
+});
+
+test('the diag route reports what the bridge has served', async () => {
+  // Without this, "did the mutation arrive" can only be answered from DevTools.
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    await h.request('get?sessionId=s1');
+    await h.request('dismiss', { method: 'POST', body: { sessionId: 's1', text: 'x' } });
+    const response = await h.request('diag');
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(typeof response.body.version === 'string');
+    assert.ok(response.body.counts.dismiss >= 1, 'the mutation is counted');
+    assert.ok(response.body.counts.get >= 1, 'reads are counted');
+    const outcomes = (response.body.requests ?? []).map((entry) => `${entry.outcome}:${entry.action}`);
+    assert.ok(outcomes.includes('ok:dismiss'), 'the mutation is logged');
+  } finally { h.dispose(); }
 });
 
 test('polling does not discard a prediction already based on the newly completed turn', async () => {
@@ -263,7 +441,9 @@ test('superseded or dropped prediction failures cannot replace current state', a
     let state = (await h.request('get?sessionId=s1')).body;
     assert.equal(state.suggestion.text, 'New suggestion'); assert.equal(state.error, null);
     h.trigger(); await delay(450);
-    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    // A send, not a manual clear: the Client reports `submitted: true` and, with
+    // no live session log to consult here, the Host takes that at its word.
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: true } });
     pending[2].reject(Error('dropped failure')); await delay(10);
     state = (await h.request('get?sessionId=s1')).body;
     assert.equal(state.suggestion, null); assert.equal(state.error, null);
