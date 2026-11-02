@@ -1052,24 +1052,17 @@ export function apply(ctx, rawConfig) {
               learned.at = Date.now();
               persistFeedback();
             }
-            // `fromHistory` means the user is rejecting the line that was being
-            // shown as the auto-restore fallback. Writing it back into the ring
-            // would resurrect it on the next poll, so a rejection from history
-            // removes it instead of re-adding it.
+            // A dismissal is final: the line leaves the recall ring in BOTH
+            // cases. Writing a rejected draft back (which is what the "keep it
+            // recallable" branch used to do for a fresh draft) made the next
+            // poll paint it again from `history[0]`, so Escape looked broken.
             const shown = typeof body.text === "string" ? body.text : undefined;
             const target = shown ?? (entry === undefined ? undefined : entry.text);
             if (target !== undefined && target.length > 0) {
-              if (body.fromHistory === true) {
-                history.set(
-                  body.sessionId,
-                  (history.get(body.sessionId) ?? []).filter((item) => item !== target),
-                );
-              } else {
-                // A freshly generated draft stays recallable: the user may want
-                // it back after clearing the composer, and regenerating costs
-                // another model call.
-                history.set(body.sessionId, pushHistory(history.get(body.sessionId), target));
-              }
+              history.set(
+                body.sessionId,
+                (history.get(body.sessionId) ?? []).filter((item) => item !== target),
+              );
             }
             drafts.delete(body.sessionId);
           }

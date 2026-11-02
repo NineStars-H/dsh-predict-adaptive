@@ -197,6 +197,33 @@ test('a turn with no user message in the window still bills once', async () => {
   } finally { h.dispose(); }
 });
 
+test('a dismissed suggestion stays dismissed instead of coming back from history', async () => {
+  // The Client paints `suggestion ?? history[0]`, so a line left in the recall
+  // ring is re-shown on the very next poll. A fresh draft used to be written
+  // back into that ring on dismissal, which made Escape look broken: the ghost
+  // vanished and then reappeared a couple of seconds later.
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    const fresh = (await h.request('get?sessionId=s1')).body;
+    assert.equal(fresh.suggestion.text, 'Continue testing');
+    assert.deepEqual(fresh.history, [], 'nothing recallable before dismissing');
+
+    await h.request('dismiss', { method: 'POST', body: { sessionId: 's1', text: fresh.suggestion.text, fromHistory: false } });
+    const after = (await h.request('get?sessionId=s1')).body;
+    assert.equal(after.suggestion, null, 'the ghost is gone');
+    assert.deepEqual(after.history, [], 'and it is not recallable either');
+
+    // A dismissal of the auto-restore fallback behaves the same way.
+    h.trigger(); await delay(450);
+    const second = (await h.request('get?sessionId=s1')).body;
+    await h.request('dismiss', { method: 'POST', body: { sessionId: 's1', text: second.suggestion.text, fromHistory: true } });
+    const after2 = (await h.request('get?sessionId=s1')).body;
+    assert.equal(after2.suggestion, null);
+    assert.deepEqual(after2.history, []);
+  } finally { h.dispose(); }
+});
+
 test('settings and learned feedback survive disposal and reload', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-predict-test-'));
   const previous = process.env.DSH_PROFILE_DIR;

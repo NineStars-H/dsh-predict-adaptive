@@ -123,12 +123,17 @@ window.__ModuleLoader__.load({
       const input = useInput((state) => state);
       const [entry, setEntry] = React.useState(null);
       // Past drafts, newest first. Kept so a cleared composer can be recovered
-      // without spending another model call.
+      // without spending another model call. The Host curates this ring.
       const [past, setPast] = React.useState([]);
-      // When the composer was submitted, in epoch ms; 0 means nothing consumed.
-      // Any suggestion produced at or before this instant belongs to the previous
-      // composer and must not be shown again.
-      const consumedAtRef = React.useRef(0);
+      // When the composer emptied, in epoch ms. The Client polls every 2.5 s and
+      // the Host notices a submission on its own 2 s tick, so a poll that lands
+      // in between still reports the old draft. This marks that gap: while it is
+      // recent, the Client paints nothing and lets the Host catch up.
+      const clearedAtRef = React.useRef(0);
+      // The poll below is mounted once per session, so it must not close over
+      // `draft`; this ref carries the current value into that closure.
+      const draftRef = React.useRef('');
+      draftRef.current = draft;
 
       React.useEffect(() => {
         if (!sessionId) return undefined;
@@ -143,23 +148,24 @@ window.__ModuleLoader__.load({
             if (response.ok) {
               const body = await response.json();
               if (!cancelled) {
+                // The Host owns both halves of what to show: the current
+                // suggestion, and the ring of drafts still worth recalling. A
+                // submission clears the Host's ring, and that is the single
+                // source of truth for "this line is gone".
+                //
+                // Right after the composer empties the Host may not have seen
+                // the submission yet (it polls on its own 2 s tick), so a reply
+                // carrying the old draft is stale for this window and must not
+                // repaint it. The grace period is longer than one Host tick.
+                const settling = clearedAtRef.current !== 0 && Date.now() - clearedAtRef.current < 3000;
                 const next = body.suggestion ?? null;
-                const consumedAt = consumedAtRef.current;
                 const ring = Array.isArray(body.history) ? body.history : [];
-                // A suggestion newer than the submission belongs to the next
-                // turn and clears the consumed state.
-                if (next !== null && (consumedAt === 0 || (next.at ?? 0) > consumedAt)) {
-                  consumedAtRef.current = 0;
-                  setEntry(next);
-                  setPast(ring);
-                } else if (consumedAt === 0) {
-                  setEntry(null);
-                  setPast(ring);
-                } else {
-                  // Consumed and still waiting for the next prediction: keep the
-                  // composer clear even if the Host has not dropped its copy yet.
+                if (settling && (next !== null || ring.length > 0) && draftRef.current.length === 0) {
                   setEntry(null);
                   setPast([]);
+                } else {
+                  setEntry(next);
+                  setPast(ring);
                 }
               }
             }
@@ -179,23 +185,31 @@ window.__ModuleLoader__.load({
       const phase = input?.phase;
       const attachmentCount = Array.isArray(input?.attachmentIds) ? input.attachmentIds.length : 0;
 
-      // Sending consumes whatever was pending, whether the user sent the
-      // suggestion or typed their own message. Mark it consumed, hide it
-      // locally, and tell the Host to drop its copy so a poll cannot bring it
-      // back during the (possibly long) next turn.
+      // A send empties the composer. The poll that follows decides what comes
+      // back, so this only has to hide the locally cached copy immediately.
+      //
+      // `phase` is not a usable signal here: the Host enters `submitting` only
+      // on the command/claim path, so an ordinary send leaves it `plain` and a
+      // `phase === 'submitting'` watch never fires. What every send does produce
+      // is a `commit-draft` effect that clears the editor, so "draft went from
+      // non-empty to empty" is the observable proxy.
+      //
+      // Nothing is marked consumed here on purpose. The Host is authoritative:
+      // a real submission clears its recall ring within one 2 s poll, while a
+      // manual clear leaves the ring intact. Dropping `past` now hides the ghost
+      // instantly in both cases, and the next poll restores it only if the Host
+      // still has it — which is what keeps "clear the composer and the
+      // suggestion returns" working.
+      const previousDraftRef = React.useRef(draft);
       React.useEffect(() => {
-        if (phase !== 'submitting') return;
-        consumedAtRef.current = Date.now();
+        const previous = previousDraftRef.current;
+        previousDraftRef.current = draft;
+        if (previous.length === 0 || draft.length > 0) return undefined;
+        clearedAtRef.current = Date.now();
         setEntry(null);
         setPast([]);
-        if (!sessionId) return;
-        fetch(`${ROUTE}/drop`, {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: String(sessionId) }),
-        }).catch(() => {});
-      }, [phase, sessionId]);
+        return undefined;
+      }, [draft]);
 
       /** Tell the Host how a draft was treated, so it can steer later ones. */
       const report = React.useCallback(
