@@ -25,12 +25,29 @@
  * @module dsh-prompt-predict-adaptive
  */
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** Route prefix owned by this plugin; the Client half posts here. */
 const ROUTE = "/prompt-predict-adaptive";
 /** Directory name under the DSH home holding this plugin's single state file. */
 const STATE_DIR = "prompt-predict-adaptive";
+
+/**
+ * This package's own version, read from its manifest.
+ *
+ * Reported by the `/diag` route so a running profile can be identified without
+ * guessing which tag was installed. Read once at load; the file cannot change
+ * while the process runs.
+ */
+const PLUGIN_VERSION = (() => {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    return JSON.parse(readFileSync(join(here, "package.json"), "utf8")).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 /**
  * The directive. It is appended as the FINAL user message after the replayed
@@ -748,12 +765,37 @@ export function apply(ctx, rawConfig) {
   const rejected = new Map();
   const consumedAt = new Map();
 
-  /** Remember a rejected text for this session, bounded so it cannot grow. */
+  /**
+   * Remember a rejected text for this session, bounded so it cannot grow.
+   */
   function reject(sessionId, text) {
     if (typeof text !== 'string' || text.length === 0) return;
     const list = rejected.get(sessionId) ?? [];
     if (list.includes(text)) return;
     rejected.set(sessionId, [...list, text].slice(-MAX_HISTORY * 4));
+  }
+
+  /**
+   * A small ring of recent bridge requests, plus per-action counters.
+   *
+   * Kept in memory only. It answers "did my mutation actually reach the Host, and
+   * what did it answer" — the question that took a DevTools session to settle the
+   * last time a POST was silently refused.
+   */
+  const requestLog = [];
+  const requestCounts = { get: 0, diag: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
+  function recordRequest(outcome, action, method, status) {
+    const bucket = Object.hasOwn(requestCounts, action) ? action : "other";
+    requestCounts[bucket] += 1;
+    requestLog.push({
+      at: Date.now(),
+      outcome,
+      action,
+      method,
+      status,
+      origin: outcome === "rejected" ? status : undefined,
+    });
+    if (requestLog.length > 200) requestLog.splice(0, requestLog.length - 200);
   }
 
   /**
@@ -1065,12 +1107,26 @@ export function apply(ctx, rawConfig) {
       } catch {
         return send(503, { ok: false, error: "DSH connection authentication unavailable" });
       }
-      if (rejection !== undefined) return send(rejection === 403 ? 403 : 401, { ok: false, error: "unauthorized" });
-      if (req.method !== "GET" && !req.headers.origin) return send(403, { ok: false, error: "origin required" });
+      if (rejection !== undefined) {
+        recordRequest("rejected", action, req.method, rejection);
+        return send(rejection === 403 ? 403 : 401, { ok: false, error: "unauthorized" });
+      }
+
+      // No separate `Origin` requirement here.
+      //
+      // The page is served from the desktop app's `dsh-app://app` scheme, and its
+      // proxy strips `Origin` before forwarding to this route — so demanding the
+      // header rejected EVERY mutation with 403, which is why dismiss, accept and
+      // send silently never reached the Host. Cross-site forgery is already
+      // covered: the session cookie is `SameSite=Strict`, so another origin's
+      // request carries no credential and `requestRejection` answers 401 above.
 
       try {
         if (action === "get") {
           const sessionId = url.searchParams.get("sessionId") ?? "";
+          // `get` is polled continuously, so it is counted but not logged: it
+          // would drown the mutations that actually explain a bug.
+          requestCounts.get += 1;
           const entry = drafts.get(sessionId);
           const learned = feedback.get(sessionId);
           return send(200, {
@@ -1099,6 +1155,27 @@ export function apply(ctx, rawConfig) {
             learned: learned === undefined
               ? { accepted: 0, dismissed: 0 }
               : { accepted: learned.accepted.length, dismissed: learned.dismissed.length },
+            diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
+          });
+        }
+        if (action === "diag") {
+          // A plain GET so it works from any browser tab, a form, or `curl`.
+          //
+          // This exists because a whole class of bugs here is invisible from the
+          // outside: the Client sends a mutation, the Host refuses or never
+          // receives it, and the only symptom is "the ghost came back". Recording
+          // the last few requests makes that visible without DevTools.
+          return send(200, {
+            ok: true,
+            version: PLUGIN_VERSION,
+            requests: requestLog.slice(-40),
+            counts: requestCounts,
+            sessions: {
+              drafts: [...drafts.keys()],
+              rejected: [...rejected.entries()].map(([id, list]) => [id, list.length]),
+              consumedAt: [...consumedAt.entries()],
+              history: [...history.entries()].map(([id, list]) => [id, list.length]),
+            },
             diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
           });
         }
@@ -1193,6 +1270,7 @@ export function apply(ctx, rawConfig) {
             // — the "I deleted it and it came back" behaviour.
             consumePending(body.sessionId);
           }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "drop") {
@@ -1209,6 +1287,7 @@ export function apply(ctx, rawConfig) {
             consumedAt.set(body.sessionId, Date.now());
             consumePending(body.sessionId);
           }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "accepted") {
@@ -1229,6 +1308,7 @@ export function apply(ctx, rawConfig) {
             // Clear the ghost either way; the text now lives in the composer.
             drafts.delete(body.sessionId);
           }
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         if (action === "reset") {
@@ -1237,6 +1317,7 @@ export function apply(ctx, rawConfig) {
           if (typeof body.sessionId === "string" && body.sessionId.length > 0) feedback.delete(body.sessionId);
           else feedback.clear();
           persistFeedback();
+          recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
         }
         return send(404, { ok: false, error: `unknown action: ${action}` });

@@ -58,7 +58,15 @@ test('authentication is required and unavailable authentication fails closed', a
       assert.equal((await h.request(action, { method: 'POST', cookie: '', body: {} })).status, 401);
     }
     assert.equal((await h.request('get', { origin: 'http://evil' })).status, 403);
-    assert.equal((await h.request('config', { method: 'POST', origin: null, body: {} })).status, 403);
+    // A mutation WITHOUT an Origin header must still be admitted.
+    //
+    // The desktop page is served from `dsh-app://app`, and its proxy strips
+    // Origin before forwarding to this route. Requiring the header therefore
+    // rejected every mutation with 403, which is why dismiss, accept and send
+    // silently never reached the Host. Forgery is covered by the SameSite=Strict
+    // session cookie: another origin's request carries no credential and fails
+    // the `requestRejection` check above with 401.
+    assert.equal((await h.request('config', { method: 'POST', origin: null, body: {} })).status, 200);
     assert.equal((await h.request('get')).status, 200);
     assert.equal((await h.request('diagnose')).status, 405);
   } finally { h.dispose(); }
@@ -66,6 +74,50 @@ test('authentication is required and unavailable authentication fails closed', a
   try { assert.equal((await unavailable.request('get')).status, 503); } finally { unavailable.dispose(); }
   const throws = harness({ auth: () => { throw Error('unavailable'); } });
   try { assert.equal((await throws.request('get')).status, 503); } finally { throws.dispose(); }
+});
+
+test('every mutation works when the desktop proxy has stripped Origin', async () => {
+  // This is the regression that mattered.
+  //
+  // The page is served from `dsh-app://app`; Electron's proxy deletes `origin`
+  // (and rewrites host and cookie) before forwarding here. A rule requiring the
+  // header for non-GET requests therefore answered 403 to every mutation, so
+  // dismiss, accept and send silently never reached the Host — and the visible
+  // symptom was only "the ghost came back".
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    const suggestion = (await h.request('get?sessionId=s1')).body.suggestion;
+    assert.ok(suggestion !== null, 'a suggestion exists to act on');
+
+    // Each of these is what the Client sends through the proxy: no Origin.
+    for (const action of ['dismiss', 'accepted', 'drop', 'reset']) {
+      const response = await h.request(action, {
+        method: 'POST',
+        origin: null,
+        body: { sessionId: 's1', text: suggestion.text },
+      });
+      assert.equal(response.status, 200, `${action} must be admitted without an Origin header`);
+    }
+  } finally { h.dispose(); }
+});
+
+test('the diag route reports what the bridge has served', async () => {
+  // Without this, "did the mutation arrive" can only be answered from DevTools.
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    await h.request('get?sessionId=s1');
+    await h.request('dismiss', { method: 'POST', body: { sessionId: 's1', text: 'x' } });
+    const response = await h.request('diag');
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(typeof response.body.version === 'string');
+    assert.ok(response.body.counts.dismiss >= 1, 'the mutation is counted');
+    assert.ok(response.body.counts.get >= 1, 'reads are counted');
+    const outcomes = (response.body.requests ?? []).map((entry) => `${entry.outcome}:${entry.action}`);
+    assert.ok(outcomes.includes('ok:dismiss'), 'the mutation is logged');
+  } finally { h.dispose(); }
 });
 
 test('polling does not discard a prediction already based on the newly completed turn', async () => {
