@@ -10,6 +10,14 @@ window.__ModuleLoader__.load({
     const PACKAGE = 'dsh-prompt-predict-adaptive';
     /** The composer's own placeholder element, hidden while a suggestion shows. */
     const PLACEHOLDER = '[data-composer-placeholder]';
+    /**
+     * How long to wait before asking the Host for the current suggestion again.
+     *
+     * Only a fallback: every user action that changes the display refreshes
+     * immediately, so this timer exists to notice a prediction the Host finished on
+     * its own.
+     */
+    const IDLE_POLL_MS = 1500;
 
     /*
      * Why this looks the way it does.
@@ -58,6 +66,14 @@ window.__ModuleLoader__.load({
         permissionsHint: '告知预测当前沙箱与审批状态，避免建议出无权执行的动作。',
         learnedLabel: '学习状态',
         learnedHint: '已采纳 / 已丢弃的草稿会用于调整后续预测。',
+        usageLabel: '预测消耗',
+        usageHint: '每轮对话结束后都会发起一次预测请求。这里是它到目前为止用掉的 token；最近若干次单独列出，便于估算单轮成本。',
+        usageCalls: '调用次数',
+        usageRecent: '最近',
+        usageTotal: '累计',
+        usageUnmetered: '次未报告用量',
+        usageReset: '清零重新统计',
+        usageEmpty: '还没有产生预测。',
         save: '保存',
         saving: '保存中…',
         saved: '已保存设置',
@@ -83,6 +99,14 @@ window.__ModuleLoader__.load({
         permissionsHint: 'Tell the prediction the sandbox and approval posture, so it avoids impossible actions.',
         learnedLabel: 'Learned steering',
         learnedHint: 'Accepted / dismissed drafts steer later predictions.',
+        usageLabel: 'Prediction cost',
+        usageHint: 'Every finished turn starts one prediction request. This is the token usage it has cost so far; the recent window is listed separately so one turn\u2019s cost can be estimated.',
+        usageCalls: 'Calls',
+        usageRecent: 'Recent',
+        usageTotal: 'Total',
+        usageUnmetered: 'calls reported no usage',
+        usageReset: 'Reset counter',
+        usageEmpty: 'No predictions yet.',
         save: 'Save',
         saving: 'Saving…',
         saved: 'Settings saved',
@@ -285,7 +309,17 @@ window.__ModuleLoader__.load({
           } catch {
             /* the Host may be restarting; keep the last known state */
           }
-          if (!cancelled) timer = window.setTimeout(tick, 900);
+          /*
+           * Poll gently when idle.
+           *
+           * Every action that changes what is on screen already refreshes
+           * immediately (`refresh()` below runs after accept, dismiss and send), so
+           * this timer is only here to pick up a prediction the Host produced on
+           * its own. Polling four times a second for that spends requests on the
+           * common case where nothing changed. One and a half seconds is still
+           * quicker than a person notices a ghost appearing.
+           */
+          if (!cancelled) timer = window.setTimeout(tick, IDLE_POLL_MS);
         };
         refreshRef.current = () => {
           if (timer !== 0) window.clearTimeout(timer);
@@ -513,6 +547,8 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState('idle');
       const [error, setError] = React.useState(null);
       const [lastError, setLastError] = React.useState(null);
+      /** Predictions are billed every turn; show the running total, not nothing. */
+      const [usage, setUsage] = React.useState(null);
 
       React.useEffect(() => {
         let cancelled = false;
@@ -528,6 +564,7 @@ window.__ModuleLoader__.load({
               setDraft(body.config);
             } else setError('no config in response');
             if (typeof body.error === 'string' && body.error.length > 0) setLastError(body.error);
+            if (body && body.usage) setUsage(body.usage);
           })
           .catch((reason) => {
             if (!cancelled) setError(String(reason && reason.message ? reason.message : reason));
@@ -683,6 +720,78 @@ window.__ModuleLoader__.load({
             t.reset,
           ),
         ),
+        /*
+         * What this feature costs.
+         *
+         * Two lines rather than one: a lifetime total alone cannot answer "what
+         * does one turn cost", and a per-call average alone hides the size of the
+         * bill. Cache reads are called out because they are billed differently from
+         * fresh input and are the bulk of a warm call.
+         */
+        usage === null
+          ? null
+          : row(
+              t.usageLabel,
+              t.usageHint,
+              h(
+                'div',
+                { style: { display: 'flex', alignItems: 'center', gap: '10px', flex: '0 0 auto' } },
+                h(
+                  'div',
+                  {
+                    style: {
+                      fontSize: '11px',
+                      lineHeight: '1.6',
+                      textAlign: 'right',
+                      fontVariantNumeric: 'tabular-nums',
+                      opacity: 0.85,
+                      whiteSpace: 'pre',
+                    },
+                  },
+                  usage.calls === 0
+                    ? t.usageEmpty
+                    : [
+                        `${t.usageTotal}  ${usage.calls} ${t.usageCalls}`,
+                        `in ${usage.inputTokens}  out ${usage.outputTokens}`,
+                        `cache r ${usage.cacheReadTokens}  w ${usage.cacheWriteTokens}`,
+                        usage.recentCalls > 0 ? `${t.usageRecent} ${usage.recentCalls}: ${usage.recentTotal} tokens` : '',
+                        usage.unmeteredCalls > 0 ? `${usage.unmeteredCalls} ${t.usageUnmetered}` : '',
+                      ]
+                        .filter((line) => line.length > 0)
+                        .join('\n'),
+                ),
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    disabled: busy || usage.calls === 0,
+                    onClick: async () => {
+                      setStatus('saving');
+                      try {
+                        const response = await fetch(`${ROUTE}/resetusage`, {
+                          method: 'POST',
+                          credentials: 'same-origin',
+                          headers: { 'content-type': 'application/json' },
+                          body: JSON.stringify({}),
+                        });
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        const body = await response.json();
+                        setUsage(body.usage ?? null);
+                      } catch (reason) {
+                        setError(String(reason && reason.message ? reason.message : reason));
+                      }
+                      setStatus('idle');
+                    },
+                    style: {
+                      ...styles.control,
+                      cursor: busy || usage.calls === 0 ? 'default' : 'pointer',
+                      opacity: busy || usage.calls === 0 ? 0.5 : 1,
+                    },
+                  },
+                  t.usageReset,
+                ),
+              ),
+            ),
         h(
           'div',
           {

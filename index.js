@@ -32,6 +32,17 @@ import { fileURLToPath } from "node:url";
 const ROUTE = "/prompt-predict-adaptive";
 /** Directory name under the DSH home holding this plugin's single state file. */
 const STATE_DIR = "prompt-predict-adaptive";
+/**
+ * How often the safety-net scan runs.
+ *
+ * The turn signals arrive by event, so this scan exists only to catch a session
+ * that appeared without `agent/created` reaching the plugin and to notice a
+ * `turn/end` the event path missed. Neither is time-critical, and the scan walks
+ * the tail of every live session, so running it twice a second spends real work
+ * on a path that is almost always a no-op. Five seconds still recovers long
+ * before anyone would notice.
+ */
+const POLL_INTERVAL = 5000;
 
 /**
  * This package's own version, read from its manifest.
@@ -482,10 +493,30 @@ async function predict(ctx, agent, config, feedback, signal) {
   let raw = "";
   const chunks = [];
   let finishKind = null;
+  /*
+   * Token accounting for this call.
+   *
+   * The provider reports `{ type: "usage", usage }` just before `finish`, with
+   * inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens already summed
+   * into totalTokens. Predictions are paid for on every turn, so the settings page
+   * shows the running cost rather than leaving it invisible.
+   *
+   * Absent for some providers, so every field is optional: a missing report must
+   * not read as "this call was free".
+   */
+  let usage = null;
   for await (const chunk of ctx.llm.stream(request)) {
     if (chunks.length < 12) chunks.push(chunk.type);
     if (chunk.type === "text-delta") raw += chunk.text;
-    else if (chunk.type === "finish") {
+    else if (chunk.type === "usage" && chunk.usage !== null && typeof chunk.usage === "object") {
+      const u = chunk.usage;
+      usage = {
+        inputTokens: Number(u.inputTokens) || 0,
+        outputTokens: Number(u.outputTokens) || 0,
+        cacheReadTokens: Number(u.cacheReadTokens) || 0,
+        cacheWriteTokens: Number(u.cacheWriteTokens) || 0,
+      };
+    } else if (chunk.type === "finish") {
       finishKind = chunk.reason.kind;
       if (chunk.reason.kind === "error") {
         // Surface the provider's own words. A silent empty result is
@@ -494,6 +525,7 @@ async function predict(ctx, agent, config, feedback, signal) {
         const failure = chunk.reason.failure;
         return {
           text: "",
+          usage,
           provider: routed.provider,
           model: routed.model,
           error: failure?.code === "QUOTA" || failure?.status === 429
@@ -504,7 +536,7 @@ async function predict(ctx, agent, config, feedback, signal) {
       }
     }
   }
-  return { text: cleanPrediction(raw), provider: routed.provider, model: routed.model, debug: { chunks, finishKind, rawLen: raw.length } };
+  return { text: cleanPrediction(raw), provider: routed.provider, model: routed.model, usage, debug: { chunks, finishKind, rawLen: raw.length } };
 }
 
 /**
@@ -836,7 +868,77 @@ export function apply(ctx, rawConfig) {
    * last time a POST was silently refused.
    */
   const requestLog = [];
-  const requestCounts = { get: 0, diag: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
+  const requestCounts = { get: 0, diag: 0, resetusage: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
+  /**
+   * Token accounting, so the cost of predicting is visible instead of implied.
+   *
+   * Predictions are billed on every turn and the user never sees a number for
+   * them, which is exactly the kind of spend that should be shown rather than
+   * discovered on a bill.
+   *
+   * `recent` keeps the last RECENT_LIMIT calls for the "recent turns" figure; the
+   * totals cover the process lifetime so a long session's cost is answerable.
+   * A call whose provider reported nothing is counted in `unmetered` rather than
+   * as a free one.
+   */
+  const RECENT_LIMIT = 20;
+  const usageTotals = { calls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, unmetered: 0 };
+  const usageRecent = [];
+
+  /** Fold one call's provider-reported usage into the running figures. */
+  function recordUsage(usage) {
+    usageTotals.calls += 1;
+    if (usage === null || usage === undefined) {
+      usageTotals.unmetered += 1;
+      return;
+    }
+    usageTotals.inputTokens += usage.inputTokens;
+    usageTotals.outputTokens += usage.outputTokens;
+    usageTotals.cacheReadTokens += usage.cacheReadTokens;
+    usageTotals.cacheWriteTokens += usage.cacheWriteTokens;
+    usageRecent.push({
+      at: Date.now(),
+      input: usage.inputTokens,
+      output: usage.outputTokens,
+      cacheRead: usage.cacheReadTokens,
+      cacheWrite: usage.cacheWriteTokens,
+    });
+    if (usageRecent.length > RECENT_LIMIT) usageRecent.splice(0, usageRecent.length - RECENT_LIMIT);
+  }
+
+  /**
+   * The figures the settings page shows.
+   *
+   * `recent` is the trailing window the user asked for; `totals` is the lifetime
+   * of this process. Both are reported because a single number cannot answer both
+   * "what does one turn cost" and "what has this cost me so far".
+   */
+  function usageReport() {
+    const sum = (key, list) => list.reduce((total, item) => total + item[key], 0);
+    /*
+     * Fresh and cached tokens are reported apart rather than folded together.
+     *
+     * A cache read is billed at a discount, so adding it into the fresh count
+     * makes a warm call look more expensive than it is and a cold one look
+     * cheaper. `recentTotal` is therefore the plain attention count — tokens the
+     * model actually read and wrote — with cache shown on its own line.
+     */
+    return {
+      recentCalls: usageRecent.length,
+      recentInput: sum("input", usageRecent),
+      recentOutput: sum("output", usageRecent),
+      recentCacheRead: sum("cacheRead", usageRecent),
+      recentCacheWrite: sum("cacheWrite", usageRecent),
+      recentTotal: sum("input", usageRecent) + sum("output", usageRecent),
+      calls: usageTotals.calls,
+      inputTokens: usageTotals.inputTokens,
+      outputTokens: usageTotals.outputTokens,
+      cacheReadTokens: usageTotals.cacheReadTokens,
+      cacheWriteTokens: usageTotals.cacheWriteTokens,
+      unmeteredCalls: usageTotals.unmetered,
+    };
+  }
+
   function recordRequest(outcome, action, method, status) {
     const bucket = Object.hasOwn(requestCounts, action) ? action : "other";
     requestCounts[bucket] += 1;
@@ -846,7 +948,6 @@ export function apply(ctx, rawConfig) {
       action,
       method,
       status,
-      origin: outcome === "rejected" ? status : undefined,
     });
     if (requestLog.length > 200) requestLog.splice(0, requestLog.length - 200);
   }
@@ -976,6 +1077,7 @@ export function apply(ctx, rawConfig) {
           lastGlobalError = reason;
         } else {
           drafts.set(sessionId, { text: result.text, provider: result.provider, model: result.model, at: Date.now() });
+          recordUsage(result.usage);
           diagnostics.lastError = null;
           lastError.delete(sessionId);
           lastGlobalError = null;
@@ -1122,7 +1224,7 @@ export function apply(ctx, rawConfig) {
       diagnostics.lastAt = Date.now();
       runPrediction(agent, sessionId, lastTurn);
     }
-  }, 2000);
+  }, POLL_INTERVAL);
   if (typeof poll.unref === "function") poll.unref();
 
   // ---- Client bridge ----------------------------------------------------
@@ -1208,8 +1310,26 @@ export function apply(ctx, rawConfig) {
             learned: learned === undefined
               ? { accepted: 0, dismissed: 0 }
               : { accepted: learned.accepted.length, dismissed: learned.dismissed.length },
+            // What predicting has cost so far, so the spend is visible rather than
+            // only implied by a number on a bill.
+            usage: usageReport(),
             diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
           });
+        }
+        if (action === "resetusage") {
+          // Zero the counters. A user comparing "before" and "after" a setting
+          // change needs a way to start counting from now; without it the lifetime
+          // figures only ever grow and stop answering the question.
+          if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
+          usageTotals.calls = 0;
+          usageTotals.inputTokens = 0;
+          usageTotals.outputTokens = 0;
+          usageTotals.cacheReadTokens = 0;
+          usageTotals.cacheWriteTokens = 0;
+          usageTotals.unmetered = 0;
+          usageRecent.length = 0;
+          recordRequest('ok', action, req.method, 200);
+          return send(200, { ok: true, usage: usageReport() });
         }
         if (action === "diag") {
           // A plain GET so it works from any browser tab, a form, or `curl`.
@@ -1505,6 +1625,8 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
+
 
 
 

@@ -121,6 +121,55 @@ test('a to-do list handed to the user is not offered as a prediction', async () 
   } finally { ok.dispose(); }
 });
 
+test('prediction cost is counted and can be reset', async () => {
+  // Predictions are billed every turn and show nothing in the transcript, so the
+  // plugin reports the spend instead of leaving it to be discovered later.
+  const stream = async function* () {
+    yield { type: 'usage', usage: { inputTokens: 1000, outputTokens: 20, cacheReadTokens: 800, cacheWriteTokens: 0 } };
+    yield { type: 'text-delta', text: 'commit it' };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  };
+  const h = harness({ stream });
+  try {
+    h.trigger(); await delay(450);
+    let usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 1, 'one billed call');
+    assert.equal(usage.inputTokens, 1000);
+    assert.equal(usage.outputTokens, 20);
+    assert.equal(usage.cacheReadTokens, 800, 'cache reads are reported separately');
+    assert.equal(usage.unmeteredCalls, 0);
+
+    h.trigger(); await delay(450);
+    usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 2, 'the total accumulates');
+    assert.equal(usage.inputTokens, 2000);
+    assert.equal(usage.recentCalls, 2);
+    // Two calls of 1000 in + 20 out. Cache reads are tracked but excluded from
+    // this figure: they are billed at a discount, so folding them in would
+    // misstate what a warm call costs.
+    assert.equal(usage.recentTotal, 2040);
+    assert.equal(usage.recentCacheRead, 1600);
+
+    const reset = await h.request('resetusage', { method: 'POST', body: {} });
+    assert.equal(reset.status, 200);
+    const after = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(after.calls, 0, 'the counter can be zeroed to compare settings');
+    assert.equal(after.inputTokens, 0);
+  } finally { h.dispose(); }
+});
+
+test('a provider that reports no usage is counted as unmetered, not as free', async () => {
+  // An absent report must not look like a zero-cost call.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'x' }; } });
+  try {
+    h.trigger(); await delay(450);
+    const usage = (await h.request('get?sessionId=s1')).body.usage;
+    assert.equal(usage.calls, 1);
+    assert.equal(usage.unmeteredCalls, 1);
+    assert.equal(usage.inputTokens, 0);
+  } finally { h.dispose(); }
+});
+
 test('a manual clear recalls the line while a send clears it', async () => {
   // Both transitions empty the composer, so the Client cannot tell them apart and
   // reports nothing but "the composer is empty". The Host decides from the

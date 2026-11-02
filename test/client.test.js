@@ -175,7 +175,12 @@ async function mount({
   void stylesSource;
   const stylesMatch = /const styles = \{[\s\S]*?\n    \};/.exec(SOURCE);
   assert.ok(stylesMatch, 'the styles table must exist in client.js');
-  const body = `${stylesMatch[0]}\n${extractFunction('PredictionOverlay')}\nreturn PredictionOverlay;`;
+  // The component closes over module-level constants, so they are read from the
+  // source rather than duplicated here — a copy would drift and the test would
+  // stop proving anything about the shipped file.
+  const idlePoll = /const IDLE_POLL_MS = (\d+);/.exec(SOURCE);
+  assert.ok(idlePoll, 'IDLE_POLL_MS must exist in client.js');
+  const body = `${stylesMatch[0]}\nconst IDLE_POLL_MS = ${idlePoll[1]};\n${extractFunction('PredictionOverlay')}\nreturn PredictionOverlay;`;
   // eslint-disable-next-line no-new-func -- the point is to execute the real body
   const factory = new Function('React', 'h', 'ROUTE', 'PLACEHOLDER', 'Date', body);
   const FakeDate = class extends Date {
