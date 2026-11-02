@@ -783,7 +783,7 @@ export function apply(ctx, rawConfig) {
    * last time a POST was silently refused.
    */
   const requestLog = [];
-  const requestCounts = { get: 0, diag: 0, inject: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
+  const requestCounts = { get: 0, diag: 0, accepted: 0, dismiss: 0, drop: 0, config: 0, reset: 0, other: 0 };
   function recordRequest(outcome, action, method, status) {
     const bucket = Object.hasOwn(requestCounts, action) ? action : "other";
     requestCounts[bucket] += 1;
@@ -1158,34 +1158,6 @@ export function apply(ctx, rawConfig) {
             diagnostics: { ...diagnostics, boundAgents: agentDisposers.size },
           });
         }
-        if (action === "inject") {
-          // Preload a suggestion by hand.
-          //
-          // This exists because the layout of a long suggestion cannot otherwise be
-          // checked: it only appears when the model happens to produce a long line,
-          // so a visual defect could sit unseen indefinitely. Posting text here puts
-          // it on screen exactly as a real prediction would, so the clamp can be
-          // looked at on demand instead of waited for. It is a normal session draft,
-          // so everything else — Tab, Escape, the recall ring — behaves normally.
-          if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
-          const body = await readJson(req);
-          if (typeof body.sessionId !== "string" || body.sessionId.length === 0) {
-            return send(400, { ok: false, error: "sessionId required" });
-          }
-          if (typeof body.text !== "string" || body.text.length === 0) {
-            return send(400, { ok: false, error: "text required" });
-          }
-          drafts.set(body.sessionId, {
-            text: body.text,
-            provider: body.provider ?? "inject",
-            model: body.model ?? "inject",
-            at: Date.now(),
-          });
-          rejected.set(body.sessionId, []);
-          consumedAt.set(body.sessionId, 0);
-          recordRequest('ok', action, req.method, 200);
-          return send(200, { ok: true });
-        }
         if (action === "diag") {
           // A plain GET so it works from any browser tab, a form, or `curl`.
           //
@@ -1480,4 +1452,5 @@ export const DEFAULT_CONFIG = {
 };
 
 export default { apply, inject };
+
 
