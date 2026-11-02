@@ -141,6 +141,18 @@ window.__ModuleLoader__.load({
         whiteSpace: 'pre-wrap',
         overflowWrap: 'anywhere',
         wordBreak: 'break-word',
+        // The host anchors this at a zero-height seat (`height: 0`), so a wrapped
+        // ghost simply overflows instead of growing the composer. Bounding it to
+        // the composer's own text budget — the same custom property its editor and
+        // scroll area use — keeps a long suggestion inside the card, and scrolling
+        // rather than clipping keeps the tail readable instead of cutting it off.
+        maxHeight: 'var(--dsh-composer-text-max-height, 336px)',
+        overflowY: 'auto',
+        overscrollBehavior: 'contain',
+        // Soften the top edge of the ghost so it fades out under the border rather
+        // than meeting it with a hard cut.
+        boxSizing: 'border-box',
+        paddingBottom: '2px',
       },
     };
 
@@ -152,11 +164,26 @@ window.__ModuleLoader__.load({
      * with a host render the way rewriting its text did.
      */
     function PredictionOverlay(props) {
-      const { sessionId, inputActions, useInput } = props;
+      const { sessionId, inputActions, useInput, useSession } = props;
       const input = useInput((state) => state);
       const draft = typeof input?.draft === 'string' ? input.draft : '';
       const phase = input?.phase;
       const attachmentCount = Array.isArray(input?.attachmentIds) ? input.attachmentIds.length : 0;
+
+      // A submission in flight.
+      //
+      // `pendingSubmissions` is the one signal that appears on the click's own
+      // frame: the session writes a local echo there before the prompt is even
+      // serialised, and retires it once the transcript takes over. That is exactly
+      // the window in which the ghost must not be painted, and it starts
+      // immediately — unlike `phase`, which never leaves `plain` for an ordinary
+      // send, and unlike the session log, which lags by a poll.
+      const pending = useSession === undefined
+        ? 0
+        : useSession((state) => {
+            const list = state?.pendingSubmissions;
+            return Array.isArray(list) ? list.length : 0;
+          });
 
       // What the Host last reported, and the recall list kept for instant recall.
       const [entry, setEntry] = React.useState(null);
@@ -258,6 +285,10 @@ window.__ModuleLoader__.load({
         candidate !== null &&
         draft.length === 0 &&
         attachmentCount === 0 &&
+        // A submission in flight means the composer is no longer waiting for a
+        // suggestion: hide on the same frame the user pressed send, instead of
+        // waiting for the Host to answer and retire the draft.
+        pending === 0 &&
         phase !== 'submitting' &&
         phase !== 'adjudicating';
 

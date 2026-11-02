@@ -50,6 +50,7 @@ async function mount({
   dismissed = [],
   consumedAt = 0,
   hostState = null,
+  pending = [],
   now = 1_000,
 } = {}) {
   const stateSlots = [];
@@ -199,6 +200,8 @@ async function mount({
         sessionId,
         inputActions: { captureInsertion: () => ({}), insertText: () => true, setDraft: () => {} },
         useInput: (selector) => selector({ draft, phase, attachmentIds: [], draftRev: 0 }),
+        // The live submission list: non-empty means a send is in flight.
+        useSession: (selector) => selector({ pendingSubmissions: pending }),
       });
     } finally {
       rendering = false;
@@ -432,6 +435,31 @@ test('a suggestion never paints over text the user is typing', async () => {
     assert.equal(app.tree, null);
   } finally {
     await app.dispose();
+  }
+});
+
+test('the ghost disappears the moment a submission starts', async () => {
+  // Between pressing send and the model answering there is a gap. The Host has
+  // not answered the next poll yet, so the old draft is still in hand — but the
+  // composer is no longer waiting for a suggestion, and the ghost must not be
+  // painted across it. `pendingSubmissions` is the signal that appears on the
+  // click's own frame, before the prompt is even serialised.
+  const idle = await mount({ suggestion: { text: 'run the tests', at: 2_000 } });
+  try {
+    assert.equal(idle.shownText(), 'run the tests');
+  } finally {
+    await idle.dispose();
+  }
+
+  const sending = await mount({
+    suggestion: { text: 'run the tests', at: 2_000 },
+    pending: [{ requestId: 'r1', placement: 'transcript', text: 'run the tests' }],
+  });
+  try {
+    assert.equal(sending.tree, null, 'hidden while the submission is in flight');
+    assert.notEqual(sending.placeholderVisibility(), 'hidden', 'and the placeholder is free again');
+  } finally {
+    await sending.dispose();
   }
 });
 
