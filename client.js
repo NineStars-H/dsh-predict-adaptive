@@ -8,37 +8,40 @@ window.__ModuleLoader__.load({
     const ROUTE = '/prompt-predict-adaptive';
     /** Bundle package name: the key the plugin page dispatches for config. */
     const PACKAGE = 'dsh-prompt-predict-adaptive';
+    /** The composer's own placeholder element, hidden while a suggestion shows. */
+    const PLACEHOLDER = '[data-composer-placeholder]';
 
     /*
-     * How the suggestion is drawn.
+     * Why this looks the way it does.
      *
-     * The composer owns one placeholder element (`[data-composer-placeholder]`)
-     * that it shows while the draft is empty and hides as soon as the user types.
-     * Instead of stacking a second absolutely-positioned line over it, this half
-     * REWRITES that element's text and puts the original back when the
-     * suggestion no longer applies.
+     * The suggestion is drawn by this component. An earlier revision rewrote the
+     * host's placeholder element instead, and it flickered: React owns that text
+     * node (`children: placeholderText`), so every host render put the official
+     * string back and the two fought over one element. Drawing our own node ends
+     * that conflict.
      *
-     * That single decision is what makes the interaction feel immediate:
+     * What made the old build feel slow was never the drawing, it was that every
+     * transition waited for a round trip: Escape had to tell the Host and wait
+     * for the reply to stop painting; sending waited for the Host to notice the
+     * submission; clearing waited for a poll to bring the line back.
      *
-     *   - Accepting (Tab) fills the composer, so the draft is no longer empty and
-     *     the host hides the placeholder itself. Nothing to synchronise.
-     *   - Dismissing (Esc) is one synchronous DOM write. No request, no poll, no
-     *     re-render, so it lands in the same frame as the key press.
-     *   - Sending empties the draft; the host shows the placeholder again and the
-     *     override is already cleared, so the official text is back immediately.
-     *   - Clearing the composer by hand brings the same line back for free.
-     *   - The text inherits the host's own colour, font and inset, because it is
-     *     the host's own element.
+     * So the state is split. This half owns what is on SCREEN and answers the
+     * user immediately; the Host owns what the model produced. Three local guards
+     * make that safe, and all three are synchronous:
      *
-     * Nothing here guesses at layout, and there is no local timer anywhere: a
-     * time window is what previously swallowed fresh drafts for seconds.
+     *   `dismissed`  texts the user rejected, never painted again however stale
+     *                or late a reply is. This replaces any time window.
+     *   `consumedAt` instant of the last send; a suggestion stamped at or before
+     *                it belongs to the conversation the user already left.
+     *   `ring`       the Host's recall list, kept locally so a manual clear
+     *                repaints in the same frame instead of after a poll.
      */
 
     /** Two-language copy: the Client locale service is overkill for these strings. */
     const COPY = {
       zh: {
         toggleLabel: '输入框预测',
-        toggleHint: '每轮对话结束后，用当前会话所选模型起草你的下一句话，替换输入框的占位提示。按 Tab 填入。',
+        toggleHint: '每轮对话结束后，用当前会话所选模型起草你的下一句话，显示在输入框上方。按 Tab 填入，按 Esc 丢弃。',
         contextLabel: '预测上下文',
         contextHint: '完整会重放整段对话；最近轮次只保留末尾几轮。',
         contextFull: '完整上下文',
@@ -63,7 +66,7 @@ window.__ModuleLoader__.load({
       },
       en: {
         toggleLabel: 'Composer predictions',
-        toggleHint: 'After each turn, the session model drafts your next message in place of the composer placeholder. Press Tab to fill it in.',
+        toggleHint: 'After each turn, the session model drafts your next message above the composer. Tab fills it in, Esc drops it.',
         contextLabel: 'Prediction context',
         contextHint: 'Full replays the whole conversation; recent keeps only the trailing turns.',
         contextFull: 'Full context',
@@ -119,96 +122,57 @@ window.__ModuleLoader__.load({
         color: 'inherit',
         flex: '0 0 auto',
       },
+      ghost: {
+        position: 'absolute',
+        // 8px card padding-top + 4px editor padding-top.
+        top: '12px',
+        // The editor's own left padding, so the ghost starts on the same column
+        // as typed text.
+        left: '14px',
+        right: '8px',
+        font: 'inherit',
+        fontSize: 'inherit',
+        lineHeight: 'inherit',
+        fontWeight: 'inherit',
+        fontStyle: 'normal',
+        color: 'var(--dsw-alias-label-caption)',
+        pointerEvents: 'none',
+        userSelect: 'none',
+        whiteSpace: 'pre-wrap',
+        overflowWrap: 'anywhere',
+        wordBreak: 'break-word',
+      },
     };
 
-    /** Selector for the composer's own placeholder element. */
-    const PLACEHOLDER = '[data-composer-placeholder]';
-
     /**
-     * Owns the composer placeholder's text for the whole session.
+     * The suggestion overlay.
      *
-     * The host re-renders that element whenever its own state changes, which
-     * would silently drop our override, so this watches the element and puts the
-     * override back. Writes are skipped when the text already matches, which is
-     * what stops the observer from reacting to its own work.
+     * Renders its own line and hides the host placeholder with `visibility`
+     * while it shows. React sets no style on that node, so this never competes
+     * with a host render the way rewriting its text did.
      */
-    function createPlaceholderController() {
-      let node = null;
-      let original = null;
-      let desired = null;
-      let observer = null;
-      let observedParent = null;
-
-      const lookup = () => {
-        const found = document.querySelector(PLACEHOLDER);
-        if (found !== node) {
-          node = found;
-          // A new element means the host rendered a new placeholder; its text is
-          // the authoritative "official" text again.
-          original = node === null ? null : node.textContent;
-        }
-        return node;
-      };
-
-      const write = () => {
-        const target = lookup();
-        if (target === null) return;
-        const next = desired === null ? original : desired;
-        if (next === null) return;
-        if (target.textContent !== next) target.textContent = next;
-      };
-
-      const watch = () => {
-        if (observer !== null || node === null) return;
-        const parent = node.parentNode;
-        if (parent === null || parent === observedParent) return;
-        observer?.disconnect();
-        observedParent = parent;
-        observer = new MutationObserver(() => write());
-        observer.observe(parent, { childList: true, characterData: true, subtree: true });
-      };
-
-      return {
-        /** Place `text` over the official string, or restore it with `null`. */
-        set(text) {
-          desired = text;
-          write();
-          watch();
-        },
-        /** Give the element back to the host untouched. */
-        release() {
-          desired = null;
-          write();
-          observer?.disconnect();
-          observer = null;
-          observedParent = null;
-          node = null;
-          original = null;
-        },
-      };
-    }
-
-    /**
-     * The prediction controller.
-     *
-     * Renders nothing: the visible suggestion IS the composer placeholder. This
-     * component exists to own the polling, the key handling and the DOM write.
-     */
-    function PredictionController(props) {
+    function PredictionOverlay(props) {
       const { sessionId, inputActions, useInput } = props;
       const input = useInput((state) => state);
       const draft = typeof input?.draft === 'string' ? input.draft : '';
       const phase = input?.phase;
       const attachmentCount = Array.isArray(input?.attachmentIds) ? input.attachmentIds.length : 0;
 
-      // The current suggestion and the recall ring, both curated by the Host.
+      // What the Host last reported, and the recall list kept for instant recall.
       const [entry, setEntry] = React.useState(null);
       const [ring, setRing] = React.useState([]);
 
-      const controller = React.useRef(null);
-      if (controller.current === null) controller.current = createPlaceholderController();
+      // Texts the user rejected. A stale or duplicated reply can never bring one
+      // of these back, which is what makes Escape final without a time window.
+      const dismissedRef = React.useRef(new Set());
+      // Instant of the last send; suggestions stamped at or before it are stale.
+      const consumedAtRef = React.useRef(0);
+      // Bumped on every local invalidation so an in-flight reply discards itself
+      // instead of painting over the decision the user just made.
+      const epochRef = React.useRef(0);
+      // Forces a repaint after mutating a ref.
+      const [, bump] = React.useReducer((n) => n + 1, 0);
 
-      // Pull the Host's current answer without waiting for the next tick.
       const refreshRef = React.useRef(null);
       const refresh = React.useCallback(() => {
         const run = refreshRef.current;
@@ -220,6 +184,7 @@ window.__ModuleLoader__.load({
         let cancelled = false;
         let timer = 0;
         const tick = async () => {
+          const epoch = epochRef.current;
           try {
             const response = await fetch(
               `${ROUTE}/get?sessionId=${encodeURIComponent(String(sessionId))}`,
@@ -227,7 +192,9 @@ window.__ModuleLoader__.load({
             );
             if (response.ok) {
               const body = await response.json();
-              if (!cancelled) {
+              // A decision made while this request was in flight wins: the reply
+              // describes a state the user has already left.
+              if (!cancelled && epoch === epochRef.current) {
                 setEntry(body.suggestion ?? null);
                 setRing(Array.isArray(body.history) ? body.history : []);
               }
@@ -235,7 +202,7 @@ window.__ModuleLoader__.load({
           } catch {
             /* the Host may be restarting; keep the last known state */
           }
-          if (!cancelled) timer = window.setTimeout(tick, 700);
+          if (!cancelled) timer = window.setTimeout(tick, 900);
         };
         refreshRef.current = () => {
           if (timer !== 0) window.clearTimeout(timer);
@@ -250,36 +217,45 @@ window.__ModuleLoader__.load({
         };
       }, [sessionId]);
 
-      React.useEffect(
-        () => () => {
-          controller.current?.release();
-        },
-        [],
-      );
+      // What to show. Every guard is a lookup or a comparison, so this resolves
+      // synchronously and nothing here can delay a repaint.
+      const candidate = React.useMemo(() => {
+        const usable = (text, at) => {
+          if (typeof text !== 'string' || text.length === 0) return null;
+          if (dismissedRef.current.has(text)) return null;
+          if (at !== undefined && at !== null && at <= consumedAtRef.current) return null;
+          return text;
+        };
+        const fresh = entry === null ? null : usable(entry.text, entry.at);
+        if (fresh !== null) return fresh;
+        for (const text of ring) {
+          const recalled = usable(text, undefined);
+          if (recalled !== null) return recalled;
+        }
+        return null;
+      }, [entry, ring]);
 
-      const fallback = ring.length > 0 ? ring[0] : null;
-      const suggestion = entry !== null && entry.text.length > 0 ? entry.text : fallback;
-      const isFallback = entry === null && fallback !== null;
-
-      // Whether the suggestion may replace the placeholder right now.
-      //
-      // The host hides the placeholder as soon as the draft is non-empty, so
-      // these guards only have to cover the states where it would be wrong to
-      // claim the space: text already typed, attachments in flight, or a command
-      // being adjudicated.
       const show =
-        suggestion !== null &&
-        suggestion.length > 0 &&
+        candidate !== null &&
         draft.length === 0 &&
         attachmentCount === 0 &&
         phase !== 'submitting' &&
         phase !== 'adjudicating';
 
+      // Hide the host's own placeholder while the ghost is on screen. `visibility`
+      // is ours to write: React sets no style on that element.
       React.useEffect(() => {
-        controller.current?.set(show ? suggestion : null);
-      }, [show, suggestion]);
+        if (!show) return undefined;
+        const nodes = Array.from(document.querySelectorAll(PLACEHOLDER));
+        const saved = nodes.map((node) => node.style.visibility);
+        for (const node of nodes) node.style.visibility = 'hidden';
+        return () => {
+          nodes.forEach((node, index) => {
+            node.style.visibility = saved[index] ?? '';
+          });
+        };
+      }, [show]);
 
-      /** Tell the Host how a draft was treated, so it can steer later ones. */
       const report = React.useCallback(
         (action) => {
           if (!sessionId) return;
@@ -294,75 +270,77 @@ window.__ModuleLoader__.load({
       );
 
       const accept = React.useCallback(() => {
-        if (!show || suggestion === null || !inputActions) return;
+        if (!show || candidate === null || !inputActions) return;
         let inserted = false;
         try {
           const span = inputActions.captureInsertion();
-          inserted = inputActions.insertText(suggestion, span) !== false;
+          inserted = inputActions.insertText(candidate, span) !== false;
         } catch {
-          /* the composer refused the insertion; leave the suggestion in place */
+          /* the composer refused the insertion; leave the ghost alone */
         }
         if (!inserted) return;
-        // The composer now holds the text, so the placeholder is hidden by the
-        // host itself; drop our override so a later clear cannot show stale text.
-        controller.current?.set(null);
+        // The text lives in the composer now, so this half must never paint it
+        // again; otherwise clearing the field would bring it straight back.
+        dismissedRef.current.add(candidate);
+        epochRef.current += 1;
         setEntry(null);
+        setRing((current) => current.filter((item) => item !== candidate));
+        bump();
         report('accepted');
-        refresh();
-      }, [show, suggestion, inputActions, report, refresh]);
+      }, [show, candidate, inputActions, report]);
 
       const dismiss = React.useCallback(() => {
-        if (!show || suggestion === null) return;
-        // Restore the official text first: this is synchronous, so Escape lands
-        // in the same frame as the key press.
-        controller.current?.set(null);
+        if (!show || candidate === null) return;
+        // Synchronous and final: remembered as rejected, so no reply arriving
+        // later can restore it. Nothing is awaited before the repaint.
+        dismissedRef.current.add(candidate);
+        epochRef.current += 1;
         setEntry(null);
-        setRing((current) => current.filter((item) => item !== suggestion));
-        // The Host cancels in-flight work too, so a prediction already running
-        // cannot land a moment later and put the rejected line back.
+        setRing((current) => current.filter((item) => item !== candidate));
+        bump();
+        if (!sessionId) return;
         fetch(`${ROUTE}/dismiss`, {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            sessionId: String(sessionId),
-            text: suggestion,
-            fromHistory: isFallback,
-          }),
+          body: JSON.stringify({ sessionId: String(sessionId), text: candidate }),
         })
           .then(() => refresh())
           .catch(() => {});
-      }, [show, suggestion, sessionId, isFallback, refresh]);
+      }, [show, candidate, sessionId, refresh]);
 
-      // Sending empties the composer. The host then shows the placeholder again,
-      // and it must already hold the official text rather than the line the user
-      // just rejected by sending something else.
+      // A send empties the composer. Nothing may be painted for that composer
+      // afterwards, so stamp the instant, drop the cached list, and tell the Host
+      // to forget the line. All of it is local, so the ghost is gone this frame.
       const previousDraft = React.useRef(draft);
       React.useEffect(() => {
         const before = previousDraft.current;
         previousDraft.current = draft;
         if (before.length === 0 || draft.length > 0) return;
-        controller.current?.set(null);
+        consumedAtRef.current = Date.now();
+        epochRef.current += 1;
         setEntry(null);
         setRing([]);
-        if (sessionId) {
-          fetch(`${ROUTE}/drop`, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId: String(sessionId) }),
-          }).catch(() => {});
-        }
-      }, [draft, sessionId]);
+        bump();
+        if (!sessionId) return;
+        fetch(`${ROUTE}/drop`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sessionId: String(sessionId) }),
+        })
+          .then(() => refresh())
+          .catch(() => {});
+      }, [draft, sessionId, refresh]);
 
-      // Key handling is bound for the life of the component, not for the life of
-      // one suggestion: a listener that unmounted with the ghost could not handle
-      // the next Escape, which is why Escape used to appear intermittent.
-      const latest = React.useRef({});
-      latest.current = { show, accept, dismiss };
+      // Key handling lives for the whole component. A listener tied to "a
+      // suggestion is on screen" unmounted with the ghost, so the next Escape
+      // fell through to the host and Escape looked unreliable.
+      const live = React.useRef({});
+      live.current = { show, accept, dismiss };
       React.useEffect(() => {
         const onKeyDown = (event) => {
-          const state = latest.current;
+          const state = live.current;
           if (!state.show) return;
           if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
             event.preventDefault();
@@ -378,7 +356,30 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('keydown', onKeyDown, true);
       }, []);
 
-      return null;
+      if (!show) return null;
+
+      return h(
+        'div',
+        { 'data-prompt-predict-ghost': true, style: styles.ghost },
+        h('span', { style: { minWidth: 0, flex: '1 1 auto' } }, candidate),
+        h(
+          'span',
+          {
+            style: {
+              flex: '0 0 auto',
+              alignSelf: 'flex-start',
+              marginTop: '1px',
+              padding: '0 4px',
+              borderRadius: '3px',
+              border: '1px solid var(--dsw-alias-border-l2)',
+              fontSize: '10px',
+              lineHeight: '16px',
+              opacity: 0.75,
+            },
+          },
+          'Tab',
+        ),
+      );
     }
 
     /**
@@ -391,16 +392,10 @@ window.__ModuleLoader__.load({
     function PredictionConfig(props) {
       const { view } = props;
       const t = copy();
-      // `saved` is what the Host holds; `draft` is what the form shows. Edits
-      // land in `draft` only, so nothing takes effect until Save is pressed and
-      // the user sees an explicit confirmation rather than guessing.
       const [saved, setSaved] = React.useState(null);
       const [draft, setDraft] = React.useState(null);
       const [status, setStatus] = React.useState('idle');
       const [error, setError] = React.useState(null);
-      // Why the last prediction attempt produced nothing, when it did. Shown
-      // here (not in the composer) so a rate limit is visible without touching
-      // the placeholder.
       const [lastError, setLastError] = React.useState(null);
 
       React.useEffect(() => {
@@ -478,7 +473,6 @@ window.__ModuleLoader__.load({
         );
       }
 
-      /** One labelled row with a control on the right. */
       const row = (label, hint, control) =>
         h(
           'div',
@@ -504,21 +498,9 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { style: styles.section },
-        row(
-          t.toggleLabel,
-          t.toggleHint,
-          checkbox(draft.enabled !== false, (next) => patch({ enabled: next })),
-        ),
-        row(
-          t.adaptiveLabel,
-          t.adaptiveHint,
-          checkbox(draft.adaptive !== false, (next) => patch({ adaptive: next })),
-        ),
-        row(
-          t.workspaceLabel,
-          t.workspaceHint,
-          checkbox(draft.workspace !== false, (next) => patch({ workspace: next })),
-        ),
+        row(t.toggleLabel, t.toggleHint, checkbox(draft.enabled !== false, (next) => patch({ enabled: next }))),
+        row(t.adaptiveLabel, t.adaptiveHint, checkbox(draft.adaptive !== false, (next) => patch({ adaptive: next }))),
+        row(t.workspaceLabel, t.workspaceHint, checkbox(draft.workspace !== false, (next) => patch({ workspace: next }))),
         row(
           t.permissionsLabel,
           t.permissionsHint,
@@ -585,8 +567,6 @@ window.__ModuleLoader__.load({
             t.reset,
           ),
         ),
-        // The save bar is the explicit commitment step: it only enables when an
-        // edit is pending, and it reports the outcome in place.
         h(
           'div',
           {
@@ -644,9 +624,6 @@ window.__ModuleLoader__.load({
             busy ? t.saving : t.save,
           ),
         ),
-        // A failed prediction attempt is a diagnostic, not a composer feature.
-        // Showing it here keeps the input area clean while still explaining why
-        // nothing appeared.
         lastError !== null
           ? h(
               'div',
@@ -669,7 +646,7 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('conversation.input.overlay', () =>
           ctx.slots.register(
             { name: 'conversation.input.overlay', id: 'prompt-predict-adaptive', order: 40 },
-            PredictionController,
+            PredictionOverlay,
           ),
         );
         ctx.slots.inject('plugins.bundle.config', () =>
