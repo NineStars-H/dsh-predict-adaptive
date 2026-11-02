@@ -68,26 +68,34 @@ const PLUGIN_VERSION = (() => {
  * from scratch, so this text costs one prompt per call and nothing is cached
  * across calls. That is also why it is kept short.
  *
- * Phrased as a description of the voice rather than a list of bans. Rules that
- * only say "never do X" leave the shape of X in the prompt, and the model tends
- * to reproduce what it has just been told about.
+ * The model answers in JSON rather than plain text.
+ *
+ * Plain text forced this side to GUESS what it had received — the previous version
+ * carried a battery of regexes trying to tell a user's line from an assistant's,
+ * and every one of them could only reject a shape, never ask for a better one.
+ * Codex's own implementation has the model declare the answer:
+ * `{"suggestion": "..."}` or `{"suggestion": null}`. That removes the guessing,
+ * makes "no suggestion" an explicit decision instead of a magic string, and lets
+ * the instruction say what a good draft looks like instead of what to avoid.
  */
 const INSTRUCTION = [
-  "Complete the message the user is about to type.",
+  "Predict the user's next message in this conversation.",
   "",
-  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and their cursor is in the message box; write the line they are typing next.",
+  "The transcript ends with an open USER turn, right after the assistant's reply. The user has read that reply and is typing now. Write what they are about to say.",
   "",
   "It is their own words: the thing they want done, in their register — the words they wrap around a command, the correction they fire back, or the part they typed before pasting the error.",
   "",
   "What reads as a prediction:",
-  "- Their own sentence, at whatever length the thought needs. A terse follow-up when that is what the moment calls for; two or three sentences when they are explaining a problem, describing what they saw, or pushing back on the reply.",
+  "- Their own message, at whatever length the thought needs. A terse line when that is what the moment calls for; two or three sentences when they are explaining a problem, describing what they saw, or pushing back on the reply.",
   "- Concrete: a file, a command, a check, a decision, or a specific correction to something the assistant just got wrong.",
   "- Same language they have been writing in.",
   "- They may be impatient, pleased, confused, or cutting the assistant off. Tone is part of the line.",
   "",
-  "Output their line and nothing else: no framing, no quotation marks, no list, no markdown.",
+  "Reply with JSON and nothing else:",
+  '  {"suggestion": "<their next message>"}',
+  "  {\"suggestion\": null}   when they have nothing left to say here",
   "",
-  "Answer NO_PREDICTION only when the user genuinely has nothing left to say here — they are closing the conversation, or the last exchange ended with nothing outstanding. A thank-you, a short acknowledgement or a casual remark is not that: the user is usually still going.",
+  "Use null only when the conversation is genuinely closed — they are signing off, or nothing is outstanding. A thank-you or a short acknowledgement is not that: the user is usually still going.",
   "",
   "=== TRANSCRIPT ===",
 ].join("\n");
@@ -320,67 +328,86 @@ function buildContext(session, config) {
  * @param raw - accumulated assistant text.
  * @returns the draft, or an empty string when nothing usable came back.
  */
+/**
+ * Read the model's reply as `{"suggestion": string | null}`.
+ *
+ * The model is asked for JSON so this side never has to guess what it received.
+ * The previous plain-text version carried a battery of regexes trying to tell a
+ * user's line from an assistant's, and each could only reject a shape after the
+ * fact — it could never ask the model to answer differently. Codex's own
+ * implementation has the model declare the result, and so does this.
+ *
+ * `null` is the model saying "nothing to say here", which is a far better signal
+ * than a magic string that has to be filtered out later.
+ *
+ * Tolerates the usual drift: a markdown fence around the JSON, a stray sentence
+ * before it, or a bare string instead of the object.
+ *
+ * @param raw - accumulated assistant text.
+ * @returns the draft, or an empty string when the model suggested nothing usable.
+ */
 function cleanPrediction(raw) {
   const text = (raw ?? "").trim();
   if (text.length === 0) return "";
 
+  // The JSON object may be fenced or preceded by a sentence. Take the outermost
+  // braces rather than assuming the whole reply is the document.
+  const open = text.indexOf("{");
+  const close = text.lastIndexOf("}");
+  let parsed;
+  if (open >= 0 && close > open) {
+    try {
+      parsed = JSON.parse(text.slice(open, close + 1));
+    } catch {
+      /* fall through to the plain-text path below */
+    }
+  }
+
+  if (parsed !== undefined && parsed !== null && typeof parsed === "object") {
+    const value = parsed.suggestion;
+    // The explicit "nothing to say" answer.
+    if (value === null) return "";
+    if (typeof value === "string") return normalizeDraft(value);
+    return "";
+  }
+
   /*
-   * Judge the reply as a whole, not line by line.
-   *
-   * This used to split on newlines and return the first line that passed the
-   * filters. That silently truncated every multi-sentence suggestion — the model
-   * answers with a short paragraph, and only its opening clause survived. "Their
-   * own sentence, at whatever length the thought needs" is the instruction, so the
-   * shape that has to be judged is the paragraph.
-   *
-   * Wrapping is removed, not preserved: the composer shows two lines and a hard
-   * newline in the middle of a sentence would be inserted verbatim by Tab.
+   * No JSON. A provider that ignored the format still said something, and
+   * discarding a usable line would be worse than accepting it — the whole reason
+   * this function exists is to avoid throwing away good drafts. Treat the reply as
+   * the draft, including the bare `null` an unformatted model may emit.
    */
-  let reply = text;
-  // Strip a markdown fence if the whole reply is wrapped in one.
-  const fenced = /^```[^\n]*\n([\s\S]*?)\n```$/.exec(reply);
-  if (fenced !== null) reply = fenced[1];
-  // Drop a leading bullet or heading marker, and surrounding quotes.
+  return normalizeDraft(text);
+}
+
+/**
+ * Turn one candidate string into a draft the composer can hold.
+ *
+ * Only the unambiguous cases are rejected. A separator-density rule was tried for
+ * to-do lists and dropped: measured against this user's real accepted drafts it
+ * separated them from a known-bad example by under one separator per character, so
+ * it would have thrown away good predictions to catch a bad one. A wrong draft
+ * costs one Escape; a filter that eats good drafts costs the feature.
+ *
+ * @param value - the suggested text.
+ * @returns a single-line draft, or "" when it is unusable.
+ */
+function normalizeDraft(value) {
+  let reply = String(value).trim();
+  if (reply.length === 0) return "";
+  if (/^(?:null|none|no_prediction)[.。]?$/i.test(reply)) return "";
+
+  // Strip surrounding quotes and a leading bullet or heading marker.
   reply = reply.replace(/^\s*(?:[-*•]|#+)\s+/, "").trim();
   reply = reply.replace(/^["'`“”「」]+/, "").replace(/["'`“”「」]+$/, "").trim();
   if (reply.length === 0) return "";
 
-  if (/^NO_PREDICTION[.。]?$/i.test(reply)) return "";
-  // Generous: a user can legitimately write a paragraph. The cap only exists to
-  // reject a model that ignored the instruction and wrote an essay.
+  // A cap, not a style rule: it only rejects a model that ignored the instruction
+  // and wrote an essay. A paragraph is a legitimate user message.
   if (reply.length > MAX_DRAFT_CHARS) return "";
 
-  // A draft that talks about the prediction machinery, or about being an
-  // assistant, is the model narrating its own task rather than speaking as the
-  // user. The word boundary goes after the whole group: `sure[,.]` ends in a
-  // non-word character, so a boundary inside the alternation never matched
-  // "Sure, I can help".
-  if (/^(?:sure|here'?s?|here is|the user|as an ai|i (?:cannot|can't|don't|must|should|will|need))\b/i.test(reply)) return "";
-  if (/\b(this|that|my|the) (message|instruction|prediction|request|prompt|constant)\b/i.test(reply)) return "";
-  if (/\bINSTRUCTION\b/.test(reply)) return "";
-  if (/\b(composer prediction|prediction task|you are predicting)\b/i.test(reply)) return "";
-  if (/^```/.test(reply)) return "";
-
-  /*
-   * Reject a to-do list handed to the user.
-   *
-   * The reported failure read "刷新先看这两点，两行不压工具栏、预测不再编就算过；
-   * 要是还编，把 adaptive 学习关掉再出一版给我对比" — a perfectly good
-   * ASSISTANT sentence, and not something a user types. It appears when the
-   * model writes the next step of a plan instead of the next thing the user
-   * says.
-   *
-   * Only the unambiguous shape is rejected. A separator-density rule was tried
-   * and dropped: measured against this user's real accepted drafts it separated
-   * them from the bad example by under one separator per character, so it would
-   * have thrown away good predictions to catch a bad one. The prompt handles the
-   * rest, and a wrong draft costs the user one Escape.
-   */
-  const enumerated = /(^|[，,、])\s*[一二三四1234][是.、，]|首先.*其次|一是.*二是/.test(reply);
-  if (enumerated) return "";
-
-  // Collapse the wrapping the model used for readability: the composer renders
-  // two lines and will re-wrap on its own.
+  // Wrapping is collapsed rather than preserved: the composer shows two lines and
+  // a hard newline would be inserted verbatim by Tab.
   return reply.replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
 }
 
@@ -507,6 +534,11 @@ async function predict(ctx, agent, config, feedback, signal) {
     messages: [
       { role: "user", content: [{ type: "text", text: `${instruction}${workspace}${permissions}\n${transcript}` }] },
     ],
+    // Declared empty rather than omitted, which is what Codex's own implementation
+    // sends. Omission leaves the adapter free to fall back to the session's tool
+    // surface; an explicit empty list says there is nothing to call, and the
+    // `<｜｜DSML｜｜ calls>` style answer disappears with it.
+    tools: [],
     sessionId: agent.session.id,
     ...signal === undefined ? {} : { signal },
   };

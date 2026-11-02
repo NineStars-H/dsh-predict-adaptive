@@ -122,22 +122,48 @@ test('the transcript ends on an open USER turn so the model finishes a line', as
   } finally { h.dispose(); }
 });
 
-test('a to-do list handed to the user is not offered as a prediction', async () => {
-  // The reported failure: a draft that read like the assistant's next step.
-  // An unambiguous list shape is rejected; an ordinary request is kept.
-  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: '一是不压工具栏，二是预测不编造。' }; } });
+test('the JSON contract carries a draft, or an explicit null', async () => {
+  // The model now declares its answer instead of this side guessing at prose.
+  // `{"suggestion": null}` is how it says "nothing to say here", which is a far
+  // better signal than a magic string that has to be filtered out afterwards.
+  const withDraft = harness({
+    stream: async function* () { yield { type: 'text-delta', text: '{"suggestion": "把 adaptive 学习关掉再出一版给我对比。"}' }; },
+  });
   try {
-    h.trigger(); await delay(450);
-    const draft = (await h.request('get?sessionId=s1')).body.suggestion;
-    assert.equal(draft, null, 'the enumerated list is rejected');
-  } finally { h.dispose(); }
+    withDraft.trigger(); await delay(450);
+    assert.equal(
+      (await withDraft.request('get?sessionId=s1')).body.suggestion?.text,
+      '把 adaptive 学习关掉再出一版给我对比。',
+    );
+  } finally { withDraft.dispose(); }
 
-  const ok = harness({ stream: async function* () { yield { type: 'text-delta', text: '把 adaptive 学习关掉再出一版给我对比。' }; } });
+  const nothing = harness({
+    stream: async function* () { yield { type: 'text-delta', text: '{"suggestion": null}' }; },
+  });
   try {
-    ok.trigger(); await delay(450);
-    const draft = (await ok.request('get?sessionId=s1')).body.suggestion;
-    assert.equal(draft?.text, '把 adaptive 学习关掉再出一版给我对比。', 'a normal request survives');
-  } finally { ok.dispose(); }
+    nothing.trigger(); await delay(450);
+    assert.equal((await nothing.request('get?sessionId=s1')).body.suggestion, null);
+  } finally { nothing.dispose(); }
+});
+
+test('a fenced or chatty JSON reply still yields its suggestion', async () => {
+  // Models wrap JSON in a fence or say a sentence first; neither should cost the
+  // user the draft.
+  const fenced = harness({
+    stream: async function* () { yield { type: 'text-delta', text: '```json\n{"suggestion": "先跑测试"}\n```' }; },
+  });
+  try {
+    fenced.trigger(); await delay(450);
+    assert.equal((await fenced.request('get?sessionId=s1')).body.suggestion?.text, '先跑测试');
+  } finally { fenced.dispose(); }
+
+  const chatty = harness({
+    stream: async function* () { yield { type: 'text-delta', text: 'Here is my answer:\n{"suggestion": "先跑测试"}' }; },
+  });
+  try {
+    chatty.trigger(); await delay(450);
+    assert.equal((await chatty.request('get?sessionId=s1')).body.suggestion?.text, '先跑测试');
+  } finally { chatty.dispose(); }
 });
 
 test('prediction cost is counted and can be reset', async () => {
@@ -246,8 +272,19 @@ test('a multi-sentence reply is kept whole instead of truncated to its first lin
   } finally { h.dispose(); }
 });
 
-test('a draft that speaks as the assistant is still rejected', async () => {
-  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'Sure, I can help with that.' }; } });
+test('a plain-text reply from a model that ignored the format is still used', async () => {
+  // Discarding a usable line would be worse than accepting it: the point of the
+  // parser is to avoid throwing away good drafts, and a provider that answers in
+  // prose has still answered.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: '先跑一遍测试。' }; } });
+  try {
+    h.trigger(); await delay(450);
+    assert.equal((await h.request('get?sessionId=s1')).body.suggestion?.text, '先跑一遍测试。');
+  } finally { h.dispose(); }
+});
+
+test('a bare null from an unformatted model is treated as no suggestion', async () => {
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'null' }; } });
   try {
     h.trigger(); await delay(450);
     assert.equal((await h.request('get?sessionId=s1')).body.suggestion, null);
