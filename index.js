@@ -576,59 +576,124 @@ export function apply(ctx, rawConfig) {
   // one prediction.
   const diagnostics = { created: 0, stopping: 0, idle: 0, turnEnd: 0, lastError: null, lastAt: 0 };
 
-  /** Register the turn listeners for one agent; returns its disposer. */
-  function bindAgent(agent) {
-    const sessionId = agent.session.id;
-    let pending = null;
-    /** Highest turn number seen in the current trigger burst. */
-    let scheduledTurn = 0;
-
-    /** Collapse bursts from several triggers into one prediction per turn. */
-    function schedule(reason, turn) {
-      if (pending !== null) clearTimeout(pending);
-      // Keep the highest turn seen in the burst. `agent/status` carries no turn
-      // number, so it must not erase one a sibling trigger already supplied.
-      if (Number.isInteger(turn)) scheduledTurn = Math.max(scheduledTurn, turn);
-      pending = setTimeout(() => {
-        pending = null;
-        const settled = scheduledTurn;
-        scheduledTurn = 0;
-        diagnostics.stopping += 1;
-        diagnostics.lastAt = Date.now();
-        runPrediction(agent, sessionId, settled);
-      }, 400);
-      if (reason === "turn-end") diagnostics.turnEnd += 1;
+  /** Read an agent's session id without letting a disposed agent throw. */
+  function sessionIdOf(agent) {
+    try {
+      const id = agent?.session?.id;
+      return typeof id === "string" && id.length > 0 ? id : undefined;
+    } catch {
+      return undefined;
     }
+  }
 
-    // 1) Durable turn boundary. `session/event` is scope-filtered too, so this
-    //    is registered on the agent context as well.
-    const disposeEvent = agent.ctx.on("session/event", (session, event) => {
+  /**
+   * Per-session trigger debounce state.
+   *
+   * Keyed by session id rather than by agent, because the dispatchers deliver the
+   * agent in the payload and one session has exactly one live agent.
+   */
+  const triggerStates = new Map();
+  function triggerState(sessionId, agent) {
+    let state = triggerStates.get(sessionId);
+    if (state === undefined) {
+      state = { pending: null, turn: 0, agent };
+      triggerStates.set(sessionId, state);
+    }
+    state.agent = agent;
+    return state;
+  }
+
+  /** Remember a live agent so a trigger can predict for it later. */
+  function ensureBound(agent) {
+    try {
+      if (!agentDisposers.has(agent)) agentDisposers.set(agent, bindAgent(agent));
+    } catch {
+      /* the agent is going away; the log poll will bind it if it survives */
+    }
+  }
+
+  /**
+   * Collapse the trigger burst for one session into a single prediction.
+   *
+   * A turn emits `agent/turn-stopping`, then `turn/end`, then `agent/status:
+   * idle`. All three describe the same turn, so they are debounced together and
+   * the highest turn number seen wins. The delay is short on purpose: it only
+   * collapses a burst, and every millisecond here is latency the user sees
+   * before the ghost appears.
+   */
+  function scheduleFor(sessionId, reason, turn) {
+    const agent = ctx.agents.get(sessionId);
+    if (agent === undefined) return;
+    const state = triggerState(sessionId, agent);
+    if (Number.isInteger(turn)) state.turn = Math.max(state.turn, turn);
+    if (state.pending !== null) clearTimeout(state.pending);
+    state.pending = setTimeout(() => {
+      state.pending = null;
+      const settled = state.turn;
+      state.turn = 0;
+      diagnostics.stopping += 1;
+      diagnostics.lastAt = Date.now();
+      runPrediction(agent, sessionId, settled);
+    }, 150);
+    if (reason === "turn-end") diagnostics.turnEnd += 1;
+  }
+
+  /**
+   * Register the three turn signals once for the whole plugin.
+   *
+   * They are registered on the PLUGIN's own context, not on `agent.ctx`.
+   *
+   * `agent/status`, `agent/turn-stopping` and `session/event` are dispatched
+   * through `@deepseek-ai/dsh-scope`, whose filter is:
+   *
+   *     scopeIdentityOf(listenerCtx) === undefined || === the emitting identity
+   *
+   * A listener registered on `agent.ctx` carries that agent's tag, so it only
+   * matches its own agent — which sounds right but in practice meant none of
+   * these ever fired, leaving the 2 s log poll as the real trigger and adding up
+   * to two seconds of latency to every suggestion. A listener on an untagged
+   * root context receives them all, so the payload's own `agent` (fused in by
+   * the dispatcher) identifies the session instead.
+   */
+  function bindTriggers() {
+    // 1) The loop's own stopping boundary. Fires before the turn closes, and its
+    //    payload carries the turn number, so it identifies the turn exactly.
+    const disposeStopping = ctx.on("agent/turn-stopping", (payload) => {
+      const agent = payload?.agent;
+      if (agent === undefined) return;
+      const sessionId = sessionIdOf(agent);
+      if (sessionId === undefined) return;
+      ensureBound(agent);
+      scheduleFor(sessionId, "stopping", payload?.turn);
+    });
+
+    // 2) Agent went idle: covers paths that end without a normal turn close.
+    const disposeStatus = ctx.on("agent/status", (payload) => {
+      if (payload?.status !== "idle") return;
+      const agent = payload?.agent;
+      if (agent === undefined) return;
+      const sessionId = sessionIdOf(agent);
+      if (sessionId === undefined) return;
+      ensureBound(agent);
+      diagnostics.idle += 1;
+      scheduleFor(sessionId, "idle");
+    });
+
+    // 3) Durable turn boundary: the appended `turn/end` record.
+    const disposeEvent = ctx.on("session/event", (session, event) => {
       if (event?.type !== "turn/end") return;
       const reason = event.data?.reason;
       // Only a settled turn is worth predicting against; a forked or
       // interrupted turn leaves the conversation mid-thought.
       if (reason?.kind === "forked" || reason?.kind === "aborted" || reason?.kind === "interrupted") return;
-      schedule("turn-end", event.data?.turn);
-    });
-
-    // 2) Agent went idle: covers paths that end without a normal turn close.
-    const disposeStatus = agent.ctx.on("agent/status", (payload) => {
-      if (payload?.status !== "idle") return;
-      diagnostics.idle += 1;
-      schedule("idle");
-    });
-
-    // 3) The loop's own stopping boundary. Its payload carries the turn, which
-    //    is what makes this trigger and the poll agree on the same turn.
-    const disposeStopping = agent.ctx.on("agent/turn-stopping", (payload) => {
-      schedule("stopping", payload?.turn);
+      const sessionId = typeof session?.id === "string" ? session.id : undefined;
+      if (sessionId === undefined) return;
+      const agent = ctx.agents.get(sessionId);
+      if (agent === undefined) return;
+      scheduleFor(sessionId, "turn-end", event.data?.turn);
     });
 
     return () => {
-      if (pending !== null) {
-        clearTimeout(pending);
-        pending = null;
-      }
       disposeEvent();
       disposeStatus();
       disposeStopping();
@@ -636,10 +701,33 @@ export function apply(ctx, rawConfig) {
   }
 
   /**
-   * Bumped whenever the composer is submitted.
+   * Track one agent so a trigger or the poll can predict for it.
    *
-   * A prediction started before the submission describes a turn that is already
-   * history; letting it land would drop a stale suggestion into the fresh
+   * This no longer registers listeners: the turn signals are global now (see
+   * `bindTriggers`). What is per-agent is only the bookkeeping, plus cancelling
+   * anything still in flight when the agent goes away.
+   *
+   * @returns a disposer that forgets the agent and aborts its in-flight work.
+   */
+  function bindAgent(agent) {
+    const sessionId = sessionIdOf(agent);
+    if (sessionId === undefined) return () => {};
+    triggerState(sessionId, agent);
+    return () => {
+      const state = triggerStates.get(sessionId);
+      if (state !== undefined && state.pending !== null) {
+        clearTimeout(state.pending);
+        state.pending = null;
+      }
+      triggerStates.delete(sessionId);
+    };
+  }
+
+  /**
+   * Bumped whenever the composer is submitted, dismissed, or cleared.
+   *
+   * A prediction started before that describes a conversation state the user has
+   * already left; letting it land would drop a stale line into the fresh
    * composer. Each attempt records the epoch it began under and discards its own
    * result if the epoch moved on.
    */
@@ -688,7 +776,16 @@ export function apply(ctx, rawConfig) {
     return { lastUser, turn };
   }
 
-  /** Invalidate in-flight predictions and forget anything pending for a session. */
+  /**
+   * Forget everything pending for a session and cancel work still in flight.
+   *
+   * This is the ONE "invalidate" primitive: a dismissal, a submission and a
+   * composer clear all mean the same thing — whatever the Host is about to
+   * produce belongs to a conversation state the user has already left. Bumping
+   * the epoch makes any in-flight result discard itself even if the adapter
+   * ignores the abort signal, which is why a dismissed line can never come back
+   * a few seconds later.
+   */
   function consumePending(sessionId) {
     dropEpoch.set(sessionId, (dropEpoch.get(sessionId) ?? 0) + 1);
     drafts.delete(sessionId);
@@ -702,6 +799,11 @@ export function apply(ctx, rawConfig) {
       }
       inflight.delete(sessionId);
     }
+  }
+
+  /** Forget pending work without making the dropped line recallable. */
+  function discardPending(sessionId) {
+    consumePending(sessionId);
   }
 
   /** Ask for a prediction for one agent, superseding any in-flight one. */
@@ -778,6 +880,9 @@ export function apply(ctx, rawConfig) {
 
   // Bind every agent that already exists, then every one created later.
   const agentDisposers = new Map();
+  // The turn signals are global (see `bindTriggers`), so they are registered
+  // once here rather than per agent.
+  const disposeTriggers = bindTriggers();
   const offCreated = ctx.on("agent/created", (payload) => {
     const agent = payload?.agent;
     if (agent === undefined) return;
@@ -1052,19 +1157,11 @@ export function apply(ctx, rawConfig) {
               learned.at = Date.now();
               persistFeedback();
             }
-            // A dismissal is final: the line leaves the recall ring in BOTH
-            // cases. Writing a rejected draft back (which is what the "keep it
-            // recallable" branch used to do for a fresh draft) made the next
-            // poll paint it again from `history[0]`, so Escape looked broken.
-            const shown = typeof body.text === "string" ? body.text : undefined;
-            const target = shown ?? (entry === undefined ? undefined : entry.text);
-            if (target !== undefined && target.length > 0) {
-              history.set(
-                body.sessionId,
-                (history.get(body.sessionId) ?? []).filter((item) => item !== target),
-              );
-            }
-            drafts.delete(body.sessionId);
+            // A dismissal is final AND cancels work still in flight. Without the
+            // cancellation a prediction that was already running when Esc was
+            // pressed would land a moment later and paint the rejected line back
+            // — the "I deleted it and it came back" behaviour.
+            consumePending(body.sessionId);
           }
           return send(200, { ok: true });
         }
@@ -1122,6 +1219,8 @@ export function apply(ctx, rawConfig) {
     dropEpoch.clear();
     predictionUserSeq.clear();
     predictionTurnKey.clear();
+    triggerStates.clear();
+    disposeTriggers();
     offCreated();
     offDisposed();
     for (const dispose of agentDisposers.values()) {

@@ -16,11 +16,15 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
     ctx: { on: (name, fn) => { listeners.set(name, fn); return () => listeners.delete(name); } },
   };
   const connection = auth && { requestRejection: auth };
+  // The plugin registers its turn signals on its own context, so these are the
+  // listeners the tests drive. Each listener records the last registration per
+  // event name.
+  const globalListeners = new Map();
   const ctx = {
     get: (key) => key === 'connection' ? connection : undefined,
     llm: { stream: stream ?? (async function* () { yield { type: 'text-delta', text: 'Continue testing' }; }) },
     agents: { list: () => [agent], get: () => agent },
-    on: () => () => {},
+    on: (name, fn) => { globalListeners.set(name, fn); return () => globalListeners.delete(name); },
     webServer: { register: (r) => { route = r.handler; return () => {}; } },
     effect: (fn) => { dispose = fn(); },
   };
@@ -31,8 +35,9 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
   finally { globalThis.setInterval = originalInterval; }
   return {
     dispose: () => dispose(),
-    trigger: () => listeners.get('agent/status')({ status: 'idle' }),
-    stopping: (turn) => listeners.get('agent/turn-stopping')({ turn }),
+    // The dispatcher fuses the owning agent into every payload.
+    trigger: () => globalListeners.get('agent/status')?.({ agent, status: 'idle' }),
+    stopping: (turn) => globalListeners.get('agent/turn-stopping')?.({ agent, turn }),
     poll: () => poll(),
     async request(path, { method = 'GET', cookie = 'valid', origin = 'http://localhost', body } = {}) {
       const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);

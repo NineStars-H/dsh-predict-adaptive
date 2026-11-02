@@ -125,16 +125,15 @@ window.__ModuleLoader__.load({
       // Past drafts, newest first. Kept so a cleared composer can be recovered
       // without spending another model call. The Host curates this ring.
       const [past, setPast] = React.useState([]);
-      // When the composer emptied, in epoch ms. The Client polls every 2.5 s and
-      // the Host notices a submission on its own 2 s tick, so a poll that lands
-      // in between still reports the old draft. This marks that gap: while it is
-      // recent, the Client paints nothing and lets the Host catch up.
-      const clearedAtRef = React.useRef(0);
-      // The poll below is mounted once per session, so it must not close over
-      // `draft`; this ref carries the current value into that closure. It is
-      // assigned after `draft` is read below — reading `draft` here would be a
-      // temporal-dead-zone error and would take the whole overlay down.
-      const draftRef = React.useRef('');
+      // Pull the current Host state right now instead of waiting for the next
+      // poll tick. Every user action that changes what should be on screen
+      // (accept, dismiss, clear) calls this, which is what makes those
+      // transitions feel immediate rather than "a second or two later".
+      const refreshRef = React.useRef(null);
+      const refresh = React.useCallback(() => {
+        const run = refreshRef.current;
+        if (typeof run === 'function') run();
+      }, []);
 
       React.useEffect(() => {
         if (!sessionId) return undefined;
@@ -149,35 +148,29 @@ window.__ModuleLoader__.load({
             if (response.ok) {
               const body = await response.json();
               if (!cancelled) {
-                // The Host owns both halves of what to show: the current
-                // suggestion, and the ring of drafts still worth recalling. A
-                // submission clears the Host's ring, and that is the single
-                // source of truth for "this line is gone".
-                //
-                // Right after the composer empties the Host may not have seen
-                // the submission yet (it polls on its own 2 s tick), so a reply
-                // carrying the old draft is stale for this window and must not
-                // repaint it. The grace period is longer than one Host tick.
-                const settling = clearedAtRef.current !== 0 && Date.now() - clearedAtRef.current < 3000;
-                const next = body.suggestion ?? null;
-                const ring = Array.isArray(body.history) ? body.history : [];
-                if (settling && (next !== null || ring.length > 0) && draftRef.current.length === 0) {
-                  setEntry(null);
-                  setPast([]);
-                } else {
-                  setEntry(next);
-                  setPast(ring);
-                }
+                // The Host is the single source of truth for both halves: the
+                // current suggestion, and the ring of drafts still worth
+                // recalling. Every invalidation (dismiss, send, submission) is
+                // applied on the Host, so there is nothing to second-guess here
+                // — and no local time window that could swallow a fresh draft.
+                setEntry(body.suggestion ?? null);
+                setPast(Array.isArray(body.history) ? body.history : []);
               }
             }
           } catch {
             /* the Host may be restarting; keep the last known state */
           }
-          if (!cancelled) timer = window.setTimeout(tick, 2500);
+          if (!cancelled) timer = window.setTimeout(tick, 1200);
+        };
+        refreshRef.current = () => {
+          if (timer !== 0) window.clearTimeout(timer);
+          timer = 0;
+          void tick();
         };
         tick();
         return () => {
           cancelled = true;
+          refreshRef.current = null;
           window.clearTimeout(timer);
         };
       }, [sessionId]);
@@ -185,31 +178,17 @@ window.__ModuleLoader__.load({
       const draft = typeof input?.draft === 'string' ? input.draft : '';
       const phase = input?.phase;
       const attachmentCount = Array.isArray(input?.attachmentIds) ? input.attachmentIds.length : 0;
-      // Keep the poll's view of the composer current; assigned here, after the
-      // declaration above, so no temporal-dead-zone read can occur.
-      draftRef.current = draft;
 
-      // A send empties the composer. The poll that follows decides what comes
-      // back, so this only has to hide the locally cached copy immediately.
-      //
-      // `phase` is not a usable signal here: the Host enters `submitting` only
-      // on the command/claim path, so an ordinary send leaves it `plain` and a
-      // `phase === 'submitting'` watch never fires. What every send does produce
-      // is a `commit-draft` effect that clears the editor, so "draft went from
-      // non-empty to empty" is the observable proxy.
-      //
-      // Nothing is marked consumed here on purpose. The Host is authoritative:
-      // a real submission clears its recall ring within one 2 s poll, while a
-      // manual clear leaves the ring intact. Dropping `past` now hides the ghost
-      // instantly in both cases, and the next poll restores it only if the Host
-      // still has it — which is what keeps "clear the composer and the
-      // suggestion returns" working.
+      // A send or a manual clear empties the composer. Hide the cached copy at
+      // once so the ghost never sits over an empty box; whether it comes back is
+      // then decided by the Host, which clears its ring on a real submission and
+      // keeps it on a manual clear. There is deliberately no local timer here —
+      // a time window is what previously swallowed fresh drafts for seconds.
       const previousDraftRef = React.useRef(draft);
       React.useEffect(() => {
         const previous = previousDraftRef.current;
         previousDraftRef.current = draft;
         if (previous.length === 0 || draft.length > 0) return undefined;
-        clearedAtRef.current = Date.now();
         setEntry(null);
         setPast([]);
         return undefined;
@@ -252,14 +231,20 @@ window.__ModuleLoader__.load({
         // Only a draft that actually reached the composer counts as accepted.
         if (inserted) report('accepted');
         setEntry(null);
-      }, [shownText, inputActions, report]);
+        refresh();
+      }, [shownText, inputActions, report, refresh]);
 
       const dismiss = React.useCallback(() => {
+        // Clear every local trace immediately: the draft, and the ring entry it
+        // came from. The Host's answer is authoritative, but the ring is ours to
+        // drop right now, so no poll that lands in between can repaint it.
         setEntry(null);
-        // Tell the Host which line was on screen and whether it came from the
-        // auto-restore fallback. Without that distinction the Host would write a
-        // rejected fallback back into the ring and the next poll would resurrect
-        // it, making Escape look broken.
+        setPast((current) =>
+          shownText === null || shownText.length === 0 ? [] : current.filter((item) => item !== shownText),
+        );
+        // Tell the Host to reject this line. The Host also cancels work still in
+        // flight for the session, which is what stops a prediction that was
+        // already running from landing a moment later and painting it back.
         if (sessionId && shownText !== null && shownText.length > 0) {
           fetch(`${ROUTE}/dismiss`, {
             method: 'POST',
@@ -270,16 +255,12 @@ window.__ModuleLoader__.load({
               text: shownText,
               fromHistory: isFallback,
             }),
-          }).catch(() => {});
+          }).then(() => refresh()).catch(() => {});
         } else {
           report('dismiss');
+          refresh();
         }
-        // Drop it locally too so the 2.5s poll cannot re-show it from stale
-        // state before the Host's answer lands.
-        if (isFallback && fallback !== null) {
-          setPast((current) => current.filter((item) => item !== fallback));
-        }
-      }, [report, sessionId, shownText, isFallback, fallback]);
+      }, [report, sessionId, shownText, isFallback, refresh]);
 
       const showText =
         shownText !== null &&
