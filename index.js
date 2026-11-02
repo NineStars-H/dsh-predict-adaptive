@@ -59,15 +59,18 @@ const PLUGIN_VERSION = (() => {
  * suggestion when the conversation has no obvious continuation.
  */
 const INSTRUCTION = [
-  "You are a transcript analyst. Below this instruction message is a transcript of a finished conversation between a USER and a coding ASSISTANT.",
+  "You are completing a text field, not writing an answer.",
   "",
-  "Your ONLY job: predict the single next message the USER would most likely type.",
+  "The last line of the transcript is the assistant's reply. Imagine the user has just read it and their cursor is blinking in the message box. Complete the message THEY are about to type.",
+  "",
+  "You are the user. You are not an assistant, not an analyst, and not describing the conversation. If a sentence could be read as instructions handed TO the user by someone else, it is wrong.",
   "",
   "Hard constraints:",
   "- Output plain text only. Do NOT emit tool calls, function calls, XML/DSML tags, JSON, or any protocol markup.",
   "- Do NOT continue the conversation, do NOT answer the user, do NOT write as the ASSISTANT.",
   "- Do NOT comment on this instruction or on the transcript.",
   "- There is no tool available to you. Do not attempt to use one.",
+  "- Never write a to-do list, a checklist, an imperative plan, or a summary of what should happen next. That is the assistant's voice, not the user's.",
   "",
   "Content rules:",
   "- Write in the same language the USER has been using.",
@@ -80,6 +83,7 @@ const INSTRUCTION = [
   "Grounding rules — a draft that breaks these is worse than no draft:",
   "- Only refer to things that actually appear in the transcript: files, commands, errors, decisions. Never invent a file name, a path, a test name, a number, or a claim the transcript does not contain.",
   "- Do not describe what the ASSISTANT did, and do not restate or summarise the conversation back to the user.",
+  "- Do not repeat the assistant's own suggestions back at it. If the assistant just listed things to check, the user does not read that list aloud.",
   "- Do not propose a plan the user never hinted at. Continue THEIR direction, not a plausible-sounding one of your own.",
   "- If the transcript is small talk, a bare acknowledgement, or has no open thread, output exactly: NO_PREDICTION",
   "- Before answering, check each concrete detail in your draft against the transcript. Drop anything you cannot point to.",
@@ -284,6 +288,16 @@ function buildContext(session, config) {
     lines.push(`${who}: ${item.text}`);
   }
   if (lines.length === 0) return [];
+  /*
+   * End on an open "USER:" turn.
+   *
+   * Without it the input reads as a finished document plus a task, and the model
+   * answers in an analyst's voice — lists of what to do next, or a restatement of
+   * the assistant's own last message. A dangling speaker label makes the job
+   * "finish this line" rather than "describe this", which is the whole difference
+   * between a prediction and a summary.
+   */
+  lines.push("USER:");
   const transcript = lines.join("\n\n");
   return [{ role: "user", content: [{ type: "text", text: transcript }] }];
 }
@@ -327,6 +341,23 @@ function cleanPrediction(raw) {
     if (/\b(composer prediction|prediction task|you are predicting)\b/i.test(line)) continue;
     // A markdown fence or heading is not a user message.
     if (/^```/.test(line)) continue;
+    /*
+     * Reject a numbered or explicitly enumerated list.
+     *
+     * The reported failure read "刷新先看这两点，两行不压工具栏、预测不再编就算过；
+     * 要是还编，把 adaptive 学习关掉再出一版给我对比" — a perfectly good
+     * ASSISTANT sentence, and not something a user types. It appears when the
+     * model writes the next step of a plan instead of the next thing the user
+     * says.
+     *
+     * Only the unambiguous shape is rejected. A separator-density rule was tried
+     * and dropped: measured against this user's real accepted drafts it separated
+     * them from the bad example by under one separator per character, so it would
+     * have thrown away good predictions to catch a bad one. The prompt handles the
+     * rest, and a wrong draft costs the user one Escape.
+     */
+    const enumerated = /(^|[，,、])\s*[一二三四1234][是.、，]|首先.*其次|一是.*二是/.test(line);
+    if (enumerated) continue;
     return line;
   }
   return "";

@@ -8,11 +8,11 @@ import { apply } from '../index.js';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events } = {}) {
+function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events, onStream, nodes } = {}) {
   const listeners = new Map();
   let route, dispose;
   const agent = {
-    session: { id: 's1', get seq() { return events?.length ?? 1; }, surface: { nodes: [0] }, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), eventAt: (seq) => events?.[seq] ?? {}, deriveEventMessage: () => ({ role: 'user', content: 'hello' }) },
+    session: { id: 's1', get seq() { return events?.length ?? 1; }, surface: { nodes: nodes ?? [0] }, requestHeader: () => ({ config: { provider: 'p', model: 'm' } }), eventAt: (seq) => events?.[seq] ?? {}, deriveEventMessage: (event) => (event?.data?.role !== undefined ? event.data : { role: 'user', content: 'hello' }) },
     ctx: { on: (name, fn) => { listeners.set(name, fn); return () => listeners.delete(name); } },
   };
   const connection = auth && { requestRejection: auth };
@@ -22,7 +22,15 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
   const globalListeners = new Map();
   const ctx = {
     get: (key) => key === 'connection' ? connection : undefined,
-    llm: { stream: stream ?? (async function* () { yield { type: 'text-delta', text: 'Continue testing' }; }) },
+    // `onStream` lets a test inspect the request the plugin would have sent, which
+    // is the only way to assert on prompt shape without a live provider.
+    llm: {
+      stream: async function* (request) {
+        onStream?.(request);
+        if (stream !== undefined) { yield* stream(request); return; }
+        yield { type: 'text-delta', text: 'Continue testing' };
+      },
+    },
     agents: { list: () => [agent], get: () => agent },
     on: (name, fn) => { globalListeners.set(name, fn); return () => globalListeners.delete(name); },
     webServer: { register: (r) => { route = r.handler; return () => {}; } },
@@ -74,6 +82,43 @@ test('authentication is required and unavailable authentication fails closed', a
   try { assert.equal((await unavailable.request('get')).status, 503); } finally { unavailable.dispose(); }
   const throws = harness({ auth: () => { throw Error('unavailable'); } });
   try { assert.equal((await throws.request('get')).status, 503); } finally { throws.dispose(); }
+});
+
+test('the transcript ends on an open USER turn so the model finishes a line', async () => {
+  // Without the dangling label the input reads as a finished document plus a
+  // task, and the model answers in an analyst's voice — a plan, or a restatement
+  // of the assistant's last message — instead of the next thing the user types.
+  const requests = [];
+  const events = [
+    { type: 'user/message', data: { role: 'user', content: [{ type: 'text', text: 'fix the parser' }] } },
+    { type: 'assistant/message', data: { role: 'assistant', content: [{ type: 'text', text: 'Done, tests pass.' }] } },
+  ];
+  const h = harness({ events, nodes: [0, 1], onStream: (request) => requests.push(request) });
+  try {
+    h.trigger(); await delay(450);
+    assert.equal(requests.length, 1, 'the model was asked once');
+    const prompt = requests[0].messages[0].content[0].text;
+    assert.ok(prompt.trimEnd().endsWith('USER:'), 'the transcript ends with an open USER turn');
+    assert.ok(prompt.includes('ASSISTANT: Done, tests pass.'), 'and still carries the reply above it');
+  } finally { h.dispose(); }
+});
+
+test('a to-do list handed to the user is not offered as a prediction', async () => {
+  // The reported failure: a draft that read like the assistant's next step.
+  // An unambiguous list shape is rejected; an ordinary request is kept.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: '一是不压工具栏，二是预测不编造。' }; } });
+  try {
+    h.trigger(); await delay(450);
+    const draft = (await h.request('get?sessionId=s1')).body.suggestion;
+    assert.equal(draft, null, 'the enumerated list is rejected');
+  } finally { h.dispose(); }
+
+  const ok = harness({ stream: async function* () { yield { type: 'text-delta', text: '把 adaptive 学习关掉再出一版给我对比。' }; } });
+  try {
+    ok.trigger(); await delay(450);
+    const draft = (await ok.request('get?sessionId=s1')).body.suggestion;
+    assert.equal(draft?.text, '把 adaptive 学习关掉再出一版给我对比。', 'a normal request survives');
+  } finally { ok.dispose(); }
 });
 
 test('a manual clear recalls the line while a send clears it', async () => {
