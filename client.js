@@ -141,18 +141,36 @@ window.__ModuleLoader__.load({
         whiteSpace: 'pre-wrap',
         overflowWrap: 'anywhere',
         wordBreak: 'break-word',
-        // The host anchors this at a zero-height seat (`height: 0`), so a wrapped
-        // ghost simply overflows instead of growing the composer. Bounding it to
-        // the composer's own text budget — the same custom property its editor and
-        // scroll area use — keeps a long suggestion inside the card, and scrolling
-        // rather than clipping keeps the tail readable instead of cutting it off.
-        maxHeight: 'var(--dsh-composer-text-max-height, 336px)',
-        overflowY: 'auto',
-        overscrollBehavior: 'contain',
-        // Soften the top edge of the ghost so it fades out under the border rather
-        // than meeting it with a hard cut.
-        boxSizing: 'border-box',
-        paddingBottom: '2px',
+        // The container is a row: the text, then the Tab badge beside it. The line
+        // clamp below lives on the text itself, so this stays a flex row.
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: '6px',
+        // Never taller than the space the composer reserves, whatever the text.
+        maxHeight: 'calc(var(--dsh-composer-text-max-height, 336px) / 3)',
+        overflow: 'hidden',
+      },
+      /*
+       * Clamp the suggestion itself to three lines, the way the host's placeholder
+       * behaves.
+       *
+       * That placeholder is `white-space: nowrap` with `text-overflow: ellipsis`,
+       * so the official line can never wrap; a wrapped ghost would be taller than
+       * the composer it sits in and, because the anchor is a zero-height absolutely
+       * positioned seat, would overflow the card instead of growing it.
+       *
+       * Three lines is a readable preview that fits the height already reserved, so
+       * the card never has to change size. The full text is one keypress away: Tab
+       * puts all of it into the composer.
+       */
+      ghostText: {
+        minWidth: 0,
+        flex: '1 1 auto',
+        display: '-webkit-box',
+        WebkitBoxOrient: 'vertical',
+        WebkitLineClamp: '3',
+        overflow: 'hidden',
+        textOverflow: 'ellipsis',
       },
     };
 
@@ -442,7 +460,7 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { 'data-prompt-predict-ghost': true, style: styles.ghost },
-        h('span', { style: { minWidth: 0, flex: '1 1 auto' } }, candidate),
+        h('span', { style: styles.ghostText }, candidate),
         h(
           'span',
           {
