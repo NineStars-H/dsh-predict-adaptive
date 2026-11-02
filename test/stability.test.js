@@ -8,7 +8,16 @@ import { apply } from '../index.js';
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events, onStream, nodes } = {}) {
+function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 401, stream, events, onStream, nodes, stateDir } = {}) {
+  // Every harness gets its own state directory unless a caller supplies one.
+  //
+  // Without this the plugin reads and writes the real profile: `suggestions.json`
+  // and `feedback.json` from actual use leak into assertions, so a test can pass
+  // or fail depending on what the developer did in the app beforehand.
+  const ownsDir = stateDir === undefined;
+  const dir = stateDir ?? mkdtempSync(join(tmpdir(), 'dsh-predict-test-'));
+  const previousProfile = process.env.DSH_PROFILE_DIR;
+  process.env.DSH_PROFILE_DIR = dir;
   const listeners = new Map();
   let route, dispose;
   const agent = {
@@ -42,7 +51,17 @@ function harness({ auth = (req) => req.headers.cookie === 'valid' ? undefined : 
   try { apply(ctx, { enabled: true, mode: 'full', recentTurns: 6 }); }
   finally { globalThis.setInterval = originalInterval; }
   return {
-    dispose: () => dispose(),
+    dispose: () => {
+      dispose();
+      // Put the environment back and drop the scratch directory, so one test's
+      // state cannot be read by the next. A caller-supplied directory is theirs to
+      // keep: the reload test reuses it on purpose.
+      if (previousProfile === undefined) delete process.env.DSH_PROFILE_DIR;
+      else process.env.DSH_PROFILE_DIR = previousProfile;
+      if (ownsDir) {
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    },
     // The dispatcher fuses the owning agent into every payload.
     trigger: () => globalListeners.get('agent/status')?.({ agent, status: 'idle' }),
     stopping: (turn) => globalListeners.get('agent/turn-stopping')?.({ agent, turn }),
@@ -167,6 +186,43 @@ test('a provider that reports no usage is counted as unmetered, not as free', as
     assert.equal(usage.calls, 1);
     assert.equal(usage.unmeteredCalls, 1);
     assert.equal(usage.inputTokens, 0);
+  } finally { h.dispose(); }
+});
+
+test('every prediction is logged with its context and outcome', async () => {
+  // The draft alone cannot explain a bad prediction: without knowing what the
+  // assistant had just written, a plainly wrong line and a genuine follow-up look
+  // the same. This log is what makes a wrong draft diagnosable.
+  const h = harness();
+  try {
+    h.trigger(); await delay(450);
+    const first = (await h.request('get?sessionId=s1')).body.suggestion;
+    await h.request('dismiss', { method: 'POST', body: { sessionId: 's1', text: first.text } });
+
+    h.trigger(); await delay(450);
+    await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });
+
+    const history = await h.request('history?session=s1');
+    assert.equal(history.status, 200);
+    assert.equal(history.body.entries.length, 2);
+    // Newest first.
+    assert.equal(history.body.entries[0].outcome, 'accepted');
+    assert.equal(history.body.entries[1].outcome, 'dismissed');
+    assert.equal(history.body.entries[1].text, first.text);
+    assert.ok(history.body.entries.every((entry) => entry.transcriptTail.length > 0), 'context is kept');
+  } finally { h.dispose(); }
+});
+
+test('a round that produced nothing is logged too', async () => {
+  // "Why is there no suggestion?" is answered by the log, not by the absence of a
+  // suggestion.
+  const h = harness({ stream: async function* () { yield { type: 'text-delta', text: 'NO_PREDICTION' }; } });
+  try {
+    h.trigger(); await delay(450);
+    const history = await h.request('history?session=s1');
+    assert.equal(history.body.entries.length, 1);
+    assert.equal(history.body.entries[0].text, '');
+    assert.ok(history.body.entries[0].reason.length > 0, 'the reason is recorded');
   } finally { h.dispose(); }
 });
 
@@ -403,12 +459,12 @@ test('a dismissed suggestion stays dismissed instead of coming back from history
 });
 
 test('settings and learned feedback survive disposal and reload', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-predict-test-'));
-  const previous = process.env.DSH_PROFILE_DIR;
-  process.env.DSH_PROFILE_DIR = dir;
+  // One shared directory across two starts: the point is that a restart reads back
+  // what the previous process wrote.
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-predict-reload-'));
   let h;
   try {
-    h = harness();
+    h = harness({ stateDir: dir });
     assert.equal((await h.request('config', { method: 'POST', body: { mode: 'recent', recentTurns: 3 } })).status, 200);
     h.trigger(); await delay(450);
     assert.equal((await h.request('get?sessionId=s1')).body.suggestion.text, 'Continue testing');
@@ -418,13 +474,12 @@ test('settings and learned feedback survive disposal and reload', async () => {
     h.dispose(); h = null;
     assert.equal(readFileSync(join(dir, 'prompt-predict-adaptive', 'config.json'), 'utf8'), config);
     assert.equal(readFileSync(join(dir, 'prompt-predict-adaptive', 'feedback.json'), 'utf8'), feedback);
-    h = harness();
+    h = harness({ stateDir: dir });
     const result = (await h.request('get?sessionId=s1')).body;
     assert.equal(result.config.mode, 'recent'); assert.equal(result.config.recentTurns, 3);
     assert.equal(result.learned.accepted, 1);
   } finally {
     h?.dispose();
-    if (previous === undefined) delete process.env.DSH_PROFILE_DIR; else process.env.DSH_PROFILE_DIR = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });

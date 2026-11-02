@@ -577,6 +577,24 @@ export function apply(ctx, rawConfig) {
   const stateDir = join(home, STATE_DIR);
   const stateFile = join(stateDir, "config.json");
   const feedbackFile = join(stateDir, "feedback.json");
+  /**
+   * Every suggestion, with the conversation state that produced it.
+   *
+   * `feedback.json` only keeps the drafts the user acted on, which is enough to
+   * steer the next prediction but not enough to work out WHY a draft was wrong:
+   * the text alone does not say what the assistant had just written, what the user
+   * asked before it, or whether the draft was ever shown. This log exists for
+   * that — it records the round's boundary and the tail of the transcript beside
+   * each draft, so a bad prediction can be explained instead of guessed at.
+   *
+   * Bounded on purpose: the newest HISTORY_LIMIT entries survive, because an
+   * unbounded log of conversation text is exactly the kind of quiet growth this
+   * plugin should not leave behind.
+   */
+  const historyFile = join(stateDir, "suggestions.json");
+  const HISTORY_LIMIT = 120;
+  /** How much of the transcript is kept beside each draft. */
+  const HISTORY_CONTEXT_CHARS = 1200;
 
   /**
    * Recently produced drafts per session, newest first, in memory only.
@@ -628,6 +646,72 @@ export function apply(ctx, rawConfig) {
       writeFileSync(stateFile, JSON.stringify(live, null, 2), "utf8");
     } catch {
       /* the setting simply will not survive a restart */
+    }
+  }
+
+  /** The suggestion log, newest last. Loaded once, written back on each entry. */
+  let suggestionLog = [];
+  try {
+    const parsed = JSON.parse(readFileSync(historyFile, "utf8"));
+    if (Array.isArray(parsed)) suggestionLog = parsed.filter((item) => item && typeof item === "object");
+  } catch {
+    /* first run, or removed with a previous uninstall */
+  }
+
+  /**
+   * Append one suggestion with the state that produced it.
+   *
+   * Written on every prediction, shown or not, because the interesting case is
+   * often the one the user never saw. `outcome` is filled in later by
+   * `stampOutcome`, so a single record answers "what was suggested, in what
+   * context, and did it land".
+   *
+   * @param sessionId - owning session.
+   * @param draft - the text the model produced, empty when it produced nothing.
+   * @param meta - round boundary, transcript tail, failure reason, usage.
+   */
+  function logSuggestion(sessionId, draft, meta) {
+    const entry = {
+      at: Date.now(),
+      session: String(sessionId),
+      text: typeof draft === "string" ? draft : "",
+      outcome: "pending",
+      ...meta,
+    };
+    suggestionLog.push(entry);
+    if (suggestionLog.length > HISTORY_LIMIT) {
+      suggestionLog.splice(0, suggestionLog.length - HISTORY_LIMIT);
+    }
+    persistSuggestionLog();
+    return entry;
+  }
+
+  /**
+   * Record what became of a suggestion.
+   *
+   * The newest matching entry is stamped rather than a new one appended, so the
+   * log stays one line per prediction: what was offered, and what the user did.
+   */
+  function stampOutcome(sessionId, text, outcome) {
+    for (let i = suggestionLog.length - 1; i >= 0; i -= 1) {
+      const entry = suggestionLog[i];
+      if (entry.session !== String(sessionId)) continue;
+      if (entry.outcome !== "pending") continue;
+      if (text !== undefined && entry.text !== text) continue;
+      entry.outcome = outcome;
+      entry.resolvedAt = Date.now();
+      persistSuggestionLog();
+      return;
+    }
+  }
+
+  /** Write the suggestion log back. Best effort, like every other state file. */
+  function persistSuggestionLog() {
+    try {
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(historyFile, JSON.stringify(suggestionLog, null, 2), "utf8");
+    } catch {
+      /* the log is a diagnostic aid, not part of the feature working */
     }
   }
 
@@ -1021,6 +1105,39 @@ export function apply(ctx, rawConfig) {
     consumePending(sessionId);
   }
 
+  /**
+   * A short tail of the conversation a suggestion was generated from.
+   *
+   * The draft alone cannot explain a bad prediction: without knowing what the
+   * assistant had just written, "refresh and check the two points" and a genuine
+   * user follow-up look identical. Keeping the tail makes a wrong draft
+   * diagnosable instead of mysterious.
+   *
+   * Deliberately short. This is stored beside every prediction in a bounded log,
+   * so a generous excerpt would multiply into megabytes over a long conversation.
+   *
+   * @returns the trailing characters of the rendered transcript, or "".
+   */
+  function transcriptTailOf(session) {
+    try {
+      const nodes = session.surface.nodes;
+      if (!Array.isArray(nodes) || nodes.length === 0) return "";
+      const parts = [];
+      for (let i = nodes.length - 1; i >= 0 && parts.join("\n").length < HISTORY_CONTEXT_CHARS; i -= 1) {
+        const message = session.deriveEventMessage(session.eventAt(nodes[i]));
+        if (message === undefined || message === null) continue;
+        if (message.role !== "user" && message.role !== "assistant") continue;
+        const text = textOf(message.content);
+        if (text.length === 0) continue;
+        parts.unshift(`${message.role === "user" ? "USER" : "ASSISTANT"}: ${text}`);
+      }
+      const joined = parts.join("\n\n");
+      return joined.length > HISTORY_CONTEXT_CHARS ? joined.slice(-HISTORY_CONTEXT_CHARS) : joined;
+    } catch {
+      return "";
+    }
+  }
+
   /** Ask for a prediction for one agent, superseding any in-flight one. */
   function runPrediction(agent, sessionId, turnHint) {
     if (!live.enabled) return;
@@ -1075,12 +1192,28 @@ export function apply(ctx, rawConfig) {
           diagnostics.lastError = reason;
           lastError.set(sessionId, reason);
           lastGlobalError = reason;
+          // Logged too: a round that produced nothing is the most useful record
+          // there is when someone asks why no suggestion appeared.
+          logSuggestion(sessionId, "", {
+            turn,
+            reason,
+            transcriptTail: transcriptTailOf(agent.session),
+            provider: result.provider ?? null,
+            model: result.model ?? null,
+          });
         } else {
           drafts.set(sessionId, { text: result.text, provider: result.provider, model: result.model, at: Date.now() });
           recordUsage(result.usage);
           diagnostics.lastError = null;
           lastError.delete(sessionId);
           lastGlobalError = null;
+          logSuggestion(sessionId, result.text, {
+            turn,
+            transcriptTail: transcriptTailOf(agent.session),
+            provider: result.provider ?? null,
+            model: result.model ?? null,
+            usage: result.usage ?? null,
+          });
         }
       },
       (error) => {
@@ -1090,6 +1223,7 @@ export function apply(ctx, rawConfig) {
         diagnostics.lastError = message;
         lastError.set(sessionId, message);
         lastGlobalError = message;
+        logSuggestion(sessionId, "", { turn, reason: message, transcriptTail: transcriptTailOf(agent.session) });
       },
     );
   }
@@ -1331,6 +1465,41 @@ export function apply(ctx, rawConfig) {
           recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true, usage: usageReport() });
         }
+        if (action === "history") {
+          /*
+           * The suggestion log: what was offered, in what context, and what became
+           * of it.
+           *
+           * `limit` caps the page; `session` narrows to one conversation. The full
+           * transcript tail is only returned for the entries actually asked for, so
+           * opening the settings page does not pull a megabyte of conversation
+           * text over the bridge.
+           */
+          const limitRaw = Number(url.searchParams.get("limit"));
+          const limit = Number.isInteger(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, HISTORY_LIMIT) : 30;
+          const sessionFilter = url.searchParams.get("session");
+          const matching = sessionFilter === null || sessionFilter.length === 0
+            ? suggestionLog
+            : suggestionLog.filter((entry) => entry.session === sessionFilter);
+          const page = matching.slice(-limit).reverse();
+          return send(200, {
+            ok: true,
+            total: matching.length,
+            limit,
+            entries: page.map((entry) => ({
+              at: entry.at,
+              session: entry.session,
+              text: entry.text,
+              outcome: entry.outcome,
+              turn: entry.turn ?? null,
+              reason: entry.reason ?? null,
+              provider: entry.provider ?? null,
+              model: entry.model ?? null,
+              usage: entry.usage ?? null,
+              transcriptTail: entry.transcriptTail ?? "",
+            })),
+          });
+        }
         if (action === "diag") {
           // A plain GET so it works from any browser tab, a form, or `curl`.
           //
@@ -1442,6 +1611,7 @@ export function apply(ctx, rawConfig) {
             // pressed would land a moment later and paint the rejected line back
             // — the "I deleted it and it came back" behaviour.
             consumePending(body.sessionId);
+            stampOutcome(body.sessionId, typeof body.text === "string" ? body.text : entry?.text, "dismissed");
           }
           recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
@@ -1484,6 +1654,8 @@ export function apply(ctx, rawConfig) {
               rejected.set(sessionId, []);
               drafts.delete(sessionId);
               history.delete(sessionId);
+              // The user sent their own message instead of taking the draft.
+              stampOutcome(sessionId, undefined, "superseded");
             } else {
               // Manual clear: the line was never acted on, so it stays available.
               // Move the pending draft into the ring so `history[0]` can answer
@@ -1528,6 +1700,7 @@ export function apply(ctx, rawConfig) {
             }
             // Clear the ghost either way; the text now lives in the composer.
             drafts.delete(body.sessionId);
+            stampOutcome(body.sessionId, entry.text, "accepted");
           }
           recordRequest('ok', action, req.method, 200);
           return send(200, { ok: true });
