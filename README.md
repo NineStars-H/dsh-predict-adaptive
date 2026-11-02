@@ -62,6 +62,16 @@ DeepSeek Harness 的输入框预测插件：一轮对话结束后，插件使用
 
 停用、重载、重启和卸载不会由插件自动删除这些数据。宿主清理回调不能可靠地区分停用与卸载；如果不再需要数据，请在卸载后**先确认实际根路径**，再手动删除其中的 `prompt-predict-adaptive` 目录。设置页的重置只清除学习示例，不删除配置。
 
+**卸载后清理残留数据。** 这是本插件唯一留在包体之外的东西。以本机默认布局为例，目录是 `%USERPROFILE%\.dsh\profiles\desktop\prompt-predict-adaptive`，其中 `feedback.json` 通常只有几百字节：
+
+```powershell
+# 确认路径无误后再删除
+Get-ChildItem "$env:DSH_PROFILE_DIR\prompt-predict-adaptive"
+Remove-Item "$env:DSH_PROFILE_DIR\prompt-predict-adaptive" -Recurse -Force
+```
+
+`node_modules` 下的插件目录、profile 的 `package.json` 与 `pnpm-lock.yaml` 中的条目会随卸载一并移除；上面的状态目录不会，需要手动删。
+
 桥接复用 DSH 的会话认证和 Host/Origin 检查，修改请求还要求 `Origin`。这不改变所选模型提供方对预测请求的处理方式。
 
 ## 已知限制
@@ -117,4 +127,5 @@ DeepSeek Harness 的输入框预测插件：一轮对话结束后，插件使用
 
 ## 更新记录与许可
 
-查看 [v1.0.1 发布说明](https://github.com/NineStars-H/dsh-predict-adaptive/releases/tag/v1.0.1) 了解稳定性修复。1.0.2 修复了长会话中对同一轮重复发起模型请求的问题，详见[已知限制](#已修复长会话重复计费)；1.0.3 修复了发送消息后建议重新出现并多扣一次调用的问题，见[已知限制](#已修复发送后建议重新出现)；1.0.4 修复了 Esc 不生效和 Tab 发送后灰字滞留的问题，见[已知限制](#已修复esc-不生效以及-tab-发送后灰字滞留)。项目采用 [MIT License](LICENSE)。
+查看 [v1.0.1 发布说明](https://github.com/NineStars-H/dsh-predict-adaptive/releases/tag/v1.0.1) 了解稳定性修复。1.0.2 修复了长会话中对同一轮重复发起模型请求的问题，详见[已知限制](#已修复长会话重复计费)；1.0.3 修复了发送消息后建议重新出现并多扣一次调用的问题，见[已知限制](#已修复发送后建议重新出现)；1.0.4 修复了 Esc 不生效和 Tab 发送后灰字滞留的问题；1.0.5 修复了 1.0.4 引入的崩溃（灰字完全不显示）。项目采用 [MIT License](LICENSE)。
+
