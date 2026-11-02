@@ -77,23 +77,26 @@ test('authentication is required and unavailable authentication fails closed', a
 });
 
 test('a manual clear recalls the line while a send clears it', async () => {
-  // Both transitions empty the composer, so the Client cannot tell them apart.
-  // Treating them the same is what broke "clear the field and the suggestion
-  // comes back": every clear was reported as a send, which dropped the ring.
-  const h = harness();
+  // Both transitions empty the composer, so the Client cannot tell them apart and
+  // reports nothing but "the composer is empty". The Host decides from the
+  // session log: a send appended a `user/message`, a manual clear did not.
+  const events = [];
+  const h = harness({ events });
   try {
-    // Tab, then the user clears the field by hand.
     h.trigger(); await delay(450);
     const first = (await h.request('get?sessionId=s1')).body.suggestion;
     await h.request('accepted', { method: 'POST', body: { sessionId: 's1' } });
-    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: false } });
-    const cleared = (await h.request('get?sessionId=s1')).body;
-    assert.deepEqual(cleared.history, [first.text], 'the line stays recallable');
-    assert.equal(cleared.suggestion ?? cleared.history[0], first.text, 'so it is painted again');
 
-    // Now a real send.
+    // Manual clear: the log gained nothing.
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
+    const cleared = (await h.request('get?sessionId=s1')).body;
+    assert.equal(cleared.suggestion ?? cleared.history[0], first.text, 'the line is painted again');
+    assert.deepEqual(cleared.history, [first.text], 'and it is recallable');
+
+    // A real send: the log gains a user message, which is the proof.
     h.trigger(); await delay(450);
-    await h.request('drop', { method: 'POST', body: { sessionId: 's1', submitted: true } });
+    events.push({ type: 'user/message' });
+    await h.request('drop', { method: 'POST', body: { sessionId: 's1' } });
     const sent = (await h.request('get?sessionId=s1')).body;
     assert.deepEqual(sent.history, [], 'a send leaves nothing to recall');
     assert.equal(sent.suggestion, null);

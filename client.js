@@ -330,28 +330,30 @@ window.__ModuleLoader__.load({
           .catch(() => {});
       }, [show, candidate, sessionId, refresh]);
 
-      // The composer went from non-empty to empty. Two very different events look
-      // identical here — a send, and the user clearing the field by hand — and
-      // treating them the same is what broke "clear the field and the suggestion
-      // returns". This half cannot tell them apart, so it reports the fact and
-      // lets the Host decide from the session log; `submitted` is only a hint for
-      // when the log is unavailable.
+      // The composer went from non-empty to empty. Three events look identical
+      // from here — a send, a Tab-then-clear, and typing something and deleting
+      // it — and the Client has no way to tell them apart: `InputState.phase`
+      // stays `plain` for every ordinary send, and the composer clears before the
+      // Host has appended the `user/message` that proves a send happened.
+      //
+      // So it guesses nothing and decides nothing. It reports "the composer is
+      // empty" and lets the Host settle which case it was from the session log.
+      // Until that answer arrives the ghost is hidden, which is the safe
+      // direction: a wrong guess here can only lose a line for one poll, never
+      // paint a stale one over an empty box.
       const previousDraft = React.useRef(draft);
       React.useEffect(() => {
         const before = previousDraft.current;
         previousDraft.current = draft;
         if (before.length === 0 || draft.length > 0) return;
-        const inserted = before === acceptPendingRef.current;
         acceptPendingRef.current = null;
-        // Optimistically hide it for this frame either way; the next poll either
-        // restores it (manual clear) or keeps it gone (send).
         setEntry(null);
         if (!sessionId) return;
         fetch(`${ROUTE}/drop`, {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: String(sessionId), submitted: !inserted }),
+          body: JSON.stringify({ sessionId: String(sessionId) }),
         })
           .then(() => refresh())
           .catch(() => {});

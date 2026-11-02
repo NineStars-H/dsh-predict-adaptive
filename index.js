@@ -1274,48 +1274,55 @@ export function apply(ctx, rawConfig) {
           return send(200, { ok: true });
         }
         if (action === "drop") {
-          // Tell the Host the composer went empty so whatever it produced for that
-          // composer is invalidated.
+          // The composer went empty. Decide which of the two cases it was.
           //
-          // The Client cannot distinguish a send from a manual clear: both are
-          // "the field became empty". The Host CAN, so the decision belongs here:
-          // `submitted` is true only when the session log gained a user message,
-          // which a manual clear never does.
+          // The Client cannot tell: `InputState.phase` is `plain` for an ordinary
+          // send too, and the composer clears before this process has appended the
+          // `user/message` that proves a send. So the log is the only authority,
+          // and it is read HERE, on the Host, where the append has already
+          // happened by the time the request arrives in practice.
           //
-          //   submitted   -> the line was not taken, and the user has moved on:
-          //                  drop it and do not make it recallable.
-          //   manual clear -> the user did not act on it at all: keep it in the
-          //                  ring so the ghost comes straight back, which is the
-          //                  behaviour this whole recall ring exists for.
+          //   a `user/message` appeared since the last prediction
+          //     -> a send: forget the draft and the ring, nothing should return.
+          //   nothing new in the log
+          //     -> a manual clear (Tab-then-clear, or typing then deleting):
+          //        forget only the pending draft, keep the ring so the ghost
+          //        comes straight back.
           if (req.method !== "POST") return send(405, { ok: false, error: "POST required" });
           const body = await readJson(req);
           if (typeof body.sessionId === "string") {
             const sessionId = body.sessionId;
-            // The Client knows the transition that just happened; the session log
-            // only knows it a moment later, after the Host has appended the user
-            // message. Prefer the Client's report, and consult the log only when
-            // the Client did not say — that keeps the common case free of a race
-            // where the log has not caught up and a send looks like a clear.
-            let submitted = typeof body.submitted === "boolean" ? body.submitted : false;
-            if (typeof body.submitted !== "boolean") {
-              const agent = ctx.agents.get(sessionId);
-              if (agent !== undefined) {
-                try {
-                  const boundary = logBoundary(agent.session);
-                  submitted = boundary.lastUser > (predictionUserSeq.get(sessionId) ?? -1);
-                } catch {
-                  /* the log is unavailable; keep the default */
-                }
+            let submitted = false;
+            const agent = ctx.agents.get(sessionId);
+            if (agent !== undefined) {
+              try {
+                const boundary = logBoundary(agent.session);
+                submitted = boundary.lastUser > (predictionUserSeq.get(sessionId) ?? -1);
+              } catch {
+                /* no readable log: treat it as a manual clear, the safer default */
               }
             }
+            // A Client that knows better may say so, but only to override the
+            // default when the log could not be read at all.
+            if (typeof body.submitted === "boolean" && agent === undefined) submitted = body.submitted;
+
             if (submitted) {
               consumedAt.set(sessionId, Date.now());
-              rejected.set(sessionId, []);   // nothing from the old composer is wanted
+              rejected.set(sessionId, []);
               drafts.delete(sessionId);
               history.delete(sessionId);
             } else {
-              // Manual clear: forget the pending draft but keep every line that
-              // was recallable, so the composer refills with the last suggestion.
+              // Manual clear: the line was never acted on, so it stays available.
+              // Move the pending draft into the ring so `history[0]` can answer
+              // immediately, then drop the draft itself; the Client paints
+              // `suggestion ?? history[0]`, so the ghost returns on the next read
+              // without waiting for a new prediction.
+              const pending = drafts.get(sessionId);
+              if (pending !== undefined && pending.text.length > 0) {
+                history.set(sessionId, pushHistory(history.get(sessionId), pending.text));
+                drafts.delete(sessionId);
+              }
+              // Invalidate anything still in flight for the composer just left.
               dropEpoch.set(sessionId, (dropEpoch.get(sessionId) ?? 0) + 1);
             }
             const prior = inflight.get(sessionId);
