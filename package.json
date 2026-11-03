@@ -1,6 +1,6 @@
 {
   "name": "dsh-prompt-predict-adaptive",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "scripts": { "test": "node --test" },
   "description": "Codex-style composer predictions for DeepSeek Harness: after each turn the session's own model drafts your next message as ghost text you accept with Tab.",
   "license": "MIT",
@@ -50,6 +50,7 @@
     }
   }
 }
+
 
 
 

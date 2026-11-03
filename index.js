@@ -90,6 +90,7 @@ const INSTRUCTION = [
   "- Concrete: a file, a command, a check, a decision, or a specific correction to something the assistant just got wrong.",
   "- Same language they have been writing in.",
   "- They may be impatient, pleased, confused, or cutting the assistant off. Tone is part of the line.",
+  "- Impatient still means a request. A line that scolds the assistant, or tells it off for asking, is not something anyone types to get work done — it just makes the next reply defensive.",
   "",
   /*
    * The part that matters most, and the easiest to get wrong.
@@ -100,10 +101,14 @@ const INSTRUCTION = [
    * agent receives a paragraph of commentary instead of an instruction.
    *
    * So the rule is not "explain more". It is "answer for them, in their voice".
+   *
+   * The requirement this serves is "a correct and necessary instruction". Correct
+   * and necessary are the standard; a draft that merely pushes the work back with
+   * an edge to it fails both.
    */
   "When the reply asks the user to choose, configure, or approve something technical:",
-  "- Work out what the assistant actually needs before it can continue, then write the instruction that supplies it. The user's goal is to keep the work moving, not to understand the question.",
-  "- If the assistant can reasonably decide or check it itself, that IS the right message: tell it to go ahead and use its judgement.",
+  "- Write the instruction that gives the assistant what it needs, with the detail that makes it correct. The user does not have to understand the question for the message to be a good answer to it.",
+  "- If the assistant can reasonably decide or check it itself, say so plainly — that is a complete instruction, and the most useful one when the user has no basis to choose.",
   "- When the choice genuinely needs the user — something irreversible, an external system, money, or a trade-off only they can weigh — name one option and say why, rather than listing the options back.",
   "- Never restate the question or explain the term. The draft is a message to the assistant, not a note to the user.",
   "- Do not invent settings, file names, versions or facts to fill a gap. Ask the assistant to check when you do not know.",
